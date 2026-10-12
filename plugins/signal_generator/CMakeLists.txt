@@ -1,0 +1,1 @@
+sharksdr_add_plugin(signal_generator SOURCES signal_generator.cpp)

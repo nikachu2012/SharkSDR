@@ -1,0 +1,1 @@
+sharksdr_add_plugin(rtl_tcp_source SOURCES rtl_tcp_source.cpp)

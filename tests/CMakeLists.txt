@@ -1,0 +1,6 @@
+add_executable(dsp_tests dsp_tests.cpp)
+target_link_libraries(dsp_tests PRIVATE SharkSDR_core)
+sharksdr_set_compile_options(dsp_tests)
+sharksdr_set_output_dir(dsp_tests "${SHARKSDR_OUTPUT_DIR}")
+sharksdr_set_rpath(dsp_tests "")
+add_test(NAME dsp_tests COMMAND dsp_tests WORKING_DIRECTORY "${SHARKSDR_OUTPUT_DIR}")

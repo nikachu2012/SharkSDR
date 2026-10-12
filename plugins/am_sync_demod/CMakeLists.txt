@@ -1,0 +1,1 @@
+sharksdr_add_plugin(am_sync_demod SOURCES am_sync_demod.cpp)
