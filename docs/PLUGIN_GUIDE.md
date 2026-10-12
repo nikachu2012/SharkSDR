@@ -1,11 +1,13 @@
-# SharkSDR プラグイン開発ガイド
+# SharkSDR plugin guide
 
-SharkSDR のプラグインは、`plugins/` フォルダに置かれた共有ライブラリ（`.dll` / `.so` / `.dylib`）です。
-起動時に自動で読み込まれ、メニューの **Plugins → Plugin manager** から実行中に有効／無効を切り替えられます。
+English | [日本語](PLUGIN_GUIDE.ja.md)
 
-プラグインはアプリ本体と同じ `SharkSDR_core` ライブラリにリンクするので、**同じ ImGui コンテキスト**・同じ DSP 部品・同じウィジェットをそのまま使えます。
+A SharkSDR plugin is a shared library (`.dll` / `.so` / `.dylib`) in a `plugins/` folder.
+Plugins are loaded automatically at startup and can be enabled or disabled while running from **Plugins → Plugin manager**.
 
-## 1. 最小のプラグイン
+Plugins link against the same `SharkSDR_core` library as the application, so they share **the same ImGui context** and can use the same DSP blocks and widgets directly.
+
+## 1. A minimal plugin
 
 ```cpp
 // my_plugin.cpp
@@ -20,7 +22,7 @@ public:
     }
 };
 
-//           クラス      名前          バージョン  作者  説明
+//              class     name         version  author  description
 SHARKSDR_PLUGIN(MyPlugin, "My plugin", "0.1.0", "Me", "Shows the VFO frequency")
 ```
 
@@ -29,48 +31,48 @@ SHARKSDR_PLUGIN(MyPlugin, "My plugin", "0.1.0", "Me", "Shows the VFO frequency")
 sharksdr_add_plugin(my_plugin SOURCES my_plugin.cpp)
 ```
 
-`SHARKSDR_PLUGIN` マクロが、アプリが探す C のエントリポイント（API バージョン、ビルド署名、情報、生成・破棄）を定義します。
+The `SHARKSDR_PLUGIN` macro defines the C entry points the application looks for (API version, build signature, information, create and destroy).
 
-## 2. ビルド方法
+## 2. Building
 
-どちらの方法でも、出力は `build/bin/plugins/` に置かれます。
+Either way, the output goes to `build/bin/plugins/`.
 
-**リポジトリ内に置く**: `plugins/hello_example` をコピーしてフォルダ名とターゲット名を変え、`plugins/CMakeLists.txt` の `SHARKSDR_BUNDLED_PLUGINS` に追加します。
+**Inside the repository**: copy `plugins/hello_example`, rename the folder and the target, and add it to `SHARKSDR_BUNDLED_PLUGINS` in `plugins/CMakeLists.txt`.
 
-**リポジトリの外に置く**: 本体のソースを変更せずにビルドに組み込めます。
+**Outside the repository**: add it to the build without touching the application's sources.
 
 ```sh
 cmake --preset release -DSHARKSDR_EXTRA_PLUGINS="/path/to/my_plugin;/path/to/another"
 cmake --build --preset release
 ```
 
-完成したプラグインファイルは、実行ファイル横の `plugins/`、ユーザー設定フォルダの `plugins/`、または `--plugins DIR` で指定したフォルダに置けば読み込まれます。
+A finished plugin file is loaded from the `plugins/` folder next to the executable, the `plugins/` folder in the user settings folder, or a folder given with `--plugins DIR`.
 
-> **ABI について**: プラグインは C++ のオブジェクト（`std::function`、`std::shared_ptr`、`nlohmann::json` など）をアプリとやり取りするため、
-> アプリと同じ系統のコンパイラ・同じ ImGui バージョンでビルドする必要があります（MSVC の場合は Debug/Release も一致）。
-> 一致しない場合はプラグインマネージャに理由が表示され、読み込まれません。
+> **About the ABI**: plugins exchange C++ objects (`std::function`, `std::shared_ptr`, `nlohmann::json`, etc.) with the application,
+> so they must be built with the same compiler family and the same ImGui version as the application (and, with MSVC, the same Debug/Release configuration).
+> If they do not match, the plugin manager shows the reason and the plugin is not loaded.
 
-## 3. 拡張ポイント
+## 3. Extension points
 
-`init()` に渡される `SharkSDR::Host`（[`core/include/SharkSDR/host.h`](../core/include/SharkSDR/host.h)）から登録します。
-登録したものは **プラグインのアンロード時に自動で解除** されます（解除の直後に `shutdown()` が呼ばれます）。
+Register things through the `SharkSDR::Host` passed to `init()` ([`core/include/SharkSDR/host.h`](../core/include/SharkSDR/host.h)).
+Everything you register is **removed automatically when the plugin is unloaded** (`shutdown()` is called right after that).
 
-| メソッド | 用途 | 例 |
+| Method | Purpose | Examples |
 |---|---|---|
-| `registerSource(std::shared_ptr<Source>)` | IQ ソース（ハードウェア・ネットワーク・ファイル…） | `signal_generator`, `rtl_tcp_source`, `soapy_source` |
-| `registerDemodulator(name, factory)` | 復調モード（Radio パネルにボタンが増える） | `am_sync_demod` |
-| `registerPanel(title, draw)` | サイドバーの折りたたみパネル | `recorder`, `bookmarks` |
-| `registerMenu(draw)` | Tools メニューの項目 | `bookmarks`, `hello_example` |
-| `registerFrameCallback(fn)` | 毎フレーム呼ばれる（独自ウィンドウ用） | `hello_example` |
-| `registerSpectrumOverlay(draw)` | スペクトラム上への描画・クリック処理 | `bookmarks` |
-| `addIqTap(cb)` / `addAudioTap(cb)` | IQ・復調音声の取得（DSP スレッドで呼ばれる） | `recorder` |
+| `registerSource(std::shared_ptr<Source>)` | IQ source (hardware, network, file…) | `signal_generator`, `rtl_tcp_source`, `soapy_source` |
+| `registerDemodulator(name, factory)` | Demodulation mode (adds a button to the Radio panel) | `am_sync_demod` |
+| `registerPanel(title, draw)` | Collapsible sidebar panel | `recorder`, `bookmarks` |
+| `registerMenu(draw)` | Items in the Tools menu | `bookmarks`, `hello_example` |
+| `registerFrameCallback(fn)` | Called every frame (for your own windows) | `hello_example` |
+| `registerSpectrumOverlay(draw)` | Drawing and click handling on the spectrum | `bookmarks` |
+| `addIqTap(cb)` / `addAudioTap(cb)` | Access to IQ and demodulated audio (called on the DSP thread) | `recorder` |
 
-受信機の操作（`start/stop`、`frequency/setFrequency`、`mode/setMode`、`bandwidth/setBandwidth`、`signalLevel`、`sampleRate`、`centerFrequency` など）、
-プラグイン専用の設定 `config()`（JSON、終了時に自動保存）、`log()`、`dataDirectory()` も Host から使えます。
+The Host also controls the receiver (`start/stop`, `frequency/setFrequency`, `mode/setMode`, `bandwidth/setBandwidth`, `signalLevel`, `sampleRate`, `centerFrequency`, etc.),
+and provides per-plugin settings with `config()` (JSON, saved automatically on exit), `log()` and `dataDirectory()`.
 
-## 4. ソースを作る
+## 4. Writing a source
 
-[`core/include/SharkSDR/source.h`](../core/include/SharkSDR/source.h) の `SharkSDR::Source` を実装します。
+Implement `SharkSDR::Source` from [`core/include/SharkSDR/source.h`](../core/include/SharkSDR/source.h).
 
 ```cpp
 class MySource : public SharkSDR::Source {
@@ -82,19 +84,19 @@ public:
         thread_ = std::thread([this, &sink] {
             std::vector<SharkSDR::Complex> buf(16384);
             while (!quit_) {
-                // ... デバイスから読み取り、振幅 1.0 がフルスケールの複素数に変換 ...
+                // ... read from the device and convert to complex samples, amplitude 1.0 = full scale ...
                 sink.pushSamples(buf.data(), buf.size());
             }
         });
-        return true;              // 失敗時は false を返し、lastError() で理由を返す
+        return true;              // on failure return false and give the reason in lastError()
     }
-    void stop() override {         // 戻る前にストリーミングを完全に止めること
+    void stop() override {         // streaming must have stopped completely before this returns
         quit_ = true;
         if (thread_.joinable()) thread_.join();
     }
-    double sampleRate() const override { return rate_; }      // どのスレッドからも呼ばれる
-    void tune(double hz) override { /* ハードウェアを再同調 */ }
-    void drawSettings(bool running) override { /* ImGui で設定 UI */ }
+    double sampleRate() const override { return rate_; }      // called from any thread
+    void tune(double hz) override { /* retune the hardware */ }
+    void drawSettings(bool running) override { /* settings UI with ImGui */ }
 
 private:
     std::thread thread_;
@@ -103,23 +105,23 @@ private:
 };
 ```
 
-- ストリームが自然に終わった（ファイル終端・切断など）ときは `sink.sourceStopped("理由")` を呼びます。アプリが UI スレッドで `stop()` を呼び直します。
-- 周波数を変えられないソース（ファイル再生など）は `tunable()` で `false` を返し、`frequency()` で中心周波数を返します。
-- サンプルレートは実行中に変えて構いません（`sampleRate()` の値が変わると DSP が追従します）。
+- When the stream ends by itself (end of file, disconnection, etc.), call `sink.sourceStopped("reason")`. The application then calls `stop()` on the UI thread.
+- Sources that cannot change frequency (such as file playback) return `false` from `tunable()` and report their center frequency from `frequency()`.
+- The sample rate may change while running (the DSP follows when the value of `sampleRate()` changes).
 
-## 5. 復調モードを作る
+## 5. Writing a demodulation mode
 
-[`core/include/SharkSDR/demodulator.h`](../core/include/SharkSDR/demodulator.h) の `SharkSDR::Demodulator` を実装します。
-周波数シフト・間引き・リサンプリング・チャンネルフィルタ・スケルチ・オーディオ LPF とリサンプリングはアプリ側が行うので、
-**復調処理そのものだけ** を書けば済みます。
+Implement `SharkSDR::Demodulator` from [`core/include/SharkSDR/demodulator.h`](../core/include/SharkSDR/demodulator.h).
+The application takes care of frequency shifting, decimation, resampling, the channel filter, squelch, and the audio LPF and resampling,
+so you only write **the demodulation itself**.
 
 ```cpp
 class MyDemod : public SharkSDR::Demodulator {
 public:
-    double channelRate() const override { return 24000.0; }   // 入力 IQ のレート（出力音声も同じレート）
+    double channelRate() const override { return 24000.0; }   // rate of the input IQ (the output audio uses the same rate)
     double defaultBandwidth() const override { return 6000.0; }
     SharkSDR::BandShape bandShape() const override { return SharkSDR::BandShape::Center; }
-    double audioCutoff() const override { return 3000.0; }     // これより上はアプリがカット
+    double audioCutoff() const override { return 3000.0; }     // the application cuts everything above this
 
     void process(const SharkSDR::Complex* in, size_t n, SharkSDR::Stereo* out) override {
         for (size_t i = 0; i < n; i++) out[i] = SharkSDR::Stereo(std::abs(in[i]));
@@ -129,37 +131,37 @@ public:
 host.registerDemodulator("MYMODE", [] { return std::make_unique<MyDemod>(); });
 ```
 
-モード固有の設定は `drawSettings()`（Radio パネル内に表示）、保存は `loadState()` / `saveState()` で行います。
-これらの呼び出し中は DSP スレッドが止まっているので、ロックは不要です。
+Mode-specific settings go in `drawSettings()` (shown in the Radio panel) and are saved with `loadState()` / `saveState()`.
+The DSP thread is paused during these calls, so no locking is needed.
 
-## 6. スレッドのルール
+## 6. Threading rules
 
-| 呼ばれる場所 | 対象 |
+| Called on | What |
 |---|---|
-| UI スレッド | `init` / `shutdown`、パネル・メニュー・フレームコールバック・オーバーレイ、`Source::start/stop/tune/drawSettings`、Host のほぼ全メソッド |
-| DSP スレッド | IQ／オーディオタップ、`Demodulator::process` |
-| ソース独自のスレッド | `SampleSink::pushSamples` / `sourceStopped` |
+| UI thread | `init` / `shutdown`, panels, menus, frame callbacks, overlays, `Source::start/stop/tune/drawSettings`, almost every Host method |
+| DSP thread | IQ and audio taps, `Demodulator::process` |
+| The source's own thread | `SampleSink::pushSamples` / `sourceStopped` |
 
-タップのコールバックは短く保ち、ブロックしないでください（ディスク書き込みなどは別スレッドへ。`plugins/recorder` 参照）。
-`removeTap()` から戻った後は、そのコールバックが呼ばれないことが保証されます。
+Keep tap callbacks short and never block in them (move disk writes and the like to another thread; see `plugins/recorder`).
+Once `removeTap()` returns, the callback is guaranteed not to be called again.
 
-## 7. 使える部品
+## 7. Building blocks you can use
 
-プラグインは `SharkSDR_core` の以下の部品をそのまま使えます。
+Plugins can use these parts of `SharkSDR_core` directly.
 
-- **DSP**（`SharkSDR/dsp/*.h`）: `Fft`、窓関数、`designLowpass` / `designComplexBandpass`（Kaiser 窓 FIR 設計）、`FirFilter`、`ComplexFirFilter`、`FirDecimator`、`PowerDecimator`、
-  `Resampler<T>`（任意比の多相リサンプラ）、`Nco`、`Agc`、`RingBuffer`、`OnePole`、`DcBlocker`、
-  `Receiver`（周波数シフトから復調・音声化までの受信チェーン一式。IQ タップと組み合わせて **追加の VFO** を作れます）、
-  `createBuiltinDemodulator("NFM")` など組み込み復調器の生成
-- **UI**（`SharkSDR/ui/*.h`）: `FrequencyDial`、`InputFrequency`、`PathPicker`（ファイル／フォルダ選択ダイアログ）、`LevelMeter`、`ToggleButton`、`HelpMarker`、
-  `formatFrequency` などの書式関数、`Texture`（ImGui::Image 用の GPU テクスチャ）、`fonts()`
-- **レイアウト**: サイドバーの並びを本体とそろえるための部品です。
-  - `LabeledRow("Gain")`: 左にラベル、右にウィジェット（ラベル列の幅は全パネル共通）
-  - `CheckboxRow("Squelch", &on)`: ラベルの前にチェックボックスを付けた行
-  - `SameLineColumn()`: チェックボックスやラジオボタンを 2 列にそろえる
-- **スライダー**: `ui::SliderFloat` / `ui::SliderInt` / `ui::VSliderFloat` は ImGui の同名関数と同じ引数です。
-  ダブルクリック（または Ctrl+クリック）で数値を直接入力できます（`12.5k`、`-40 dB` のような単位付きも可、範囲内に丸めます）。
-  入力が意味を持たないスライダー（再生位置など）は `ImGuiSliderFlags_NoInput` を付けてください。
+- **DSP** (`SharkSDR/dsp/*.h`): `Fft`, window functions, `designLowpass` / `designComplexBandpass` (Kaiser-window FIR design), `FirFilter`, `ComplexFirFilter`, `FirDecimator`, `PowerDecimator`,
+  `Resampler<T>` (polyphase resampler with any ratio), `Nco`, `Agc`, `RingBuffer`, `OnePole`, `DcBlocker`,
+  `Receiver` (the whole receive chain from frequency shift to audio; combine it with an IQ tap to make **an additional VFO**),
+  and creating built-in demodulators with `createBuiltinDemodulator("NFM")` and the like
+- **UI** (`SharkSDR/ui/*.h`): `FrequencyDial`, `InputFrequency`, `PathPicker` (file/folder picker dialog), `LevelMeter`, `ToggleButton`, `HelpMarker`,
+  formatting functions such as `formatFrequency`, `Texture` (a GPU texture for ImGui::Image), `fonts()`
+- **Layout**: helpers that line your rows up with the application's sidebar.
+  - `LabeledRow("Gain")`: label on the left, widget on the right (the label column has the same width in every panel)
+  - `CheckboxRow("Squelch", &on)`: a row whose label has a checkbox in front of it
+  - `SameLineColumn()`: puts checkboxes or radio buttons in two columns
+- **Sliders**: `ui::SliderFloat` / `ui::SliderInt` / `ui::VSliderFloat` take the same arguments as the ImGui functions of the same name.
+  Double-click (or Ctrl+click) one to type a value (units such as `12.5k` or `-40 dB` are accepted, and the value is clamped to the range).
+  Add `ImGuiSliderFlags_NoInput` to sliders where typing a value makes no sense (such as a playback position).
 
 ```cpp
 SharkSDR::ui::LabeledRow("Gain");
@@ -168,18 +170,19 @@ ImGui::Checkbox("Bias-T", &biasTee);
 SharkSDR::ui::SameLineColumn();
 ImGui::Checkbox("Offset", &offset);
 ```
-- **ユーティリティ**: `WavWriter` / `WavReader`（`SharkSDR/util/wav.h`）、`TcpSocket`（`SharkSDR/util/net.h`）、パス関数（`SharkSDR/paths.h`）、ログ（`SharkSDR/log.h`）
 
-## 8. 同梱プラグイン（サンプルとして）
+- **Utilities**: `WavWriter` / `WavReader` (`SharkSDR/util/wav.h`), `TcpSocket` (`SharkSDR/util/net.h`), path functions (`SharkSDR/paths.h`), logging (`SharkSDR/log.h`)
 
-| フォルダ | 内容 | 見どころ |
+## 8. Bundled plugins (as samples)
+
+| Folder | What it is | Worth a look for |
 |---|---|---|
-| `hello_example` | パネル・メニュー・独自ウィンドウ・オーディオタップ | テンプレート |
-| `signal_generator` | 仮想バンドの信号発生器ソース | `Source` の実装、送信側の変調 |
-| `file_source` | IQ ファイル再生 | 非同調ソース、`sourceStopped`、`PathPicker` |
-| `rtl_tcp_source` | rtl_tcp クライアント | `TcpSocket`、実行中の設定変更 |
-| `soapy_source` | SoapySDR | 外部ライブラリへの依存（`LIBRARIES`） |
-| `rtlsdr_source` | librtlsdr | 非同期コールバック型ドライバ |
-| `am_sync_demod` | 同期 AM（SAM） | `Demodulator` の実装、状態保存 |
-| `recorder` | 録音 | タップ、書き込みスレッド |
-| `bookmarks` | ブックマーク | スペクトラムオーバーレイ、設定の保存 |
+| `hello_example` | Panel, menu, custom window, audio tap | A template |
+| `signal_generator` | Signal generator source with a virtual band | Implementing `Source`, modulation on the transmit side |
+| `file_source` | IQ file playback | Non-tunable source, `sourceStopped`, `PathPicker` |
+| `rtl_tcp_source` | rtl_tcp client | `TcpSocket`, changing settings while running |
+| `soapy_source` | SoapySDR | Depending on an external library (`LIBRARIES`) |
+| `rtlsdr_source` | librtlsdr | A driver with asynchronous callbacks |
+| `am_sync_demod` | Synchronous AM (SAM) | Implementing `Demodulator`, saving state |
+| `recorder` | Recording | Taps, a writer thread |
+| `bookmarks` | Bookmarks | Spectrum overlay, saving settings |
