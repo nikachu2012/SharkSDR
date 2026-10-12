@@ -124,7 +124,6 @@ private:
     Drag drag_ = Drag::None;
     double dragOffset_ = 0.0;
     float dragX_ = 0.0f;
-    float hoverX_ = -1.0f;
     ImVec2 lastPlotMin_, lastPlotMax_;
     ImVec2 lastMaxSliderCenter_;
 };
