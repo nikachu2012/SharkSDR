@@ -254,7 +254,9 @@ private:
 
     // spectrum: the DSP thread collects the samples, a worker thread runs the
     // FFT. Frames are skipped while the worker is busy, so a large FFT at a
-    // high frame rate can never hold up the audio.
+    // high frame rate can never hold up the audio. Each frame averages the
+    // power of several FFTs overlapping by half (Welch's method), so the
+    // samples between two frames are analysed too instead of being skipped.
     mutable std::mutex spectrumMutex_;
     SpectrumSettings spectrumSettings_;
     uint64_t spectrumVersion_ = 1;
@@ -264,6 +266,7 @@ private:
     std::vector<Complex> fftRing_;
     size_t fftRingPos_ = 0;
     size_t fftFilled_ = 0;
+    size_t fftFresh_ = 0;  // samples since the last frame
     double fftAcc_ = 0.0;
 
     std::thread spectrumThread_;
@@ -271,7 +274,8 @@ private:
     std::condition_variable jobCv_;
     bool jobReady_ = false;                  // guarded by jobMutex_
     std::atomic<bool> spectrumBusy_{false};  // the worker owns the job below
-    std::vector<Complex> jobSamples_;        // oldest first
+    std::vector<Complex> jobSamples_;        // oldest first; FFT s starts at s * jobFftSize_ / 2
+    size_t jobFftSize_ = 0, jobSegments_ = 0;
     double jobRate_ = 0.0, jobCenter_ = 0.0;
     dsp::WindowType jobWindow_ = dsp::WindowType::BlackmanHarris;
     // worker thread only
@@ -279,6 +283,8 @@ private:
     std::vector<float> fftWindow_;
     dsp::WindowType fftWindowType_ = dsp::WindowType::BlackmanHarris;
     float fftWindowSum_ = 1.0f;
+    std::vector<Complex> fftWork_;
+    std::vector<float> fftPower_;
 
     // taps and stream hooks
     std::mutex tapsMutex_;

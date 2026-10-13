@@ -14,10 +14,10 @@ and sources, demodulation modes, panels and tools can all be added later as **pl
 
 | Area | Features |
 |---|---|
-| Display | FFT spectrum (smoothing, peak hold, fill), waterfall (Turbo / Classic / Viridis / Inferno / Grayscale), zoom and pan, dB range control, auto range. The FFT runs on its own thread, so large FFT sizes never interrupt the audio |
+| Display | FFT spectrum (each frame averages half-overlapping FFTs, so no samples are skipped and the noise floor is steady; smoothing, peak hold, fill; windows up to the 7-term Blackman-Harris), waterfall (Turbo / Classic / Viridis / Inferno / Grayscale), zoom and pan, dB range control, auto range. The FFT runs on its own thread, so large FFT sizes never interrupt the audio |
 | Tuning | Frequency dial (change each digit with the wheel or a click), click/drag tuning on the spectrum, wheel step tuning, drag the band edges to change the bandwidth, center tuning, direct entry (`145.5M` etc.) |
-| Demodulation | WFM (stereo decoder with automatic stereo/mono blend based on signal quality, 50/75 µs de-emphasis), NFM, AM, USB, LSB, DSB, CW (adjustable BFO), RAW, plus SAM (synchronous AM) as a plugin |
-| Receive chain | NCO → cascaded half-band decimation by 2 (100 dB stop band) → polyphase resampler (90 dB) → channel filter (90 dB) → squelch → demodulator → audio half-band decimation and low-pass/resampling (80 dB); SIMD (SSE2 / NEON) filters, AGC, DC removal, automatic I/Q imbalance correction, I/Q swap |
+| Demodulation | WFM (stereo decoder with automatic stereo/mono blend based on signal quality, 50/75 µs de-emphasis), NFM, AM, USB, LSB, DSB, CW (adjustable BFO) with an SDR#-style look-ahead AGC (no overshoot at the start of a word; hang, threshold, or a fixed gain), RAW, plus SAM (synchronous AM) as a plugin |
+| Receive chain | NCO → cascaded half-band decimation by 2 (100 dB stop band) → polyphase resampler (90 dB) → channel filter (90 dB; for USB / LSB the stop band starts right at the carrier) → squelch (fades in and out) → demodulator → audio half-band decimation and low-pass/resampling (80 dB); SIMD (SSE2 / NEON) filters, AGC, DC removal, automatic I/Q imbalance correction, I/Q swap |
 | Noise reduction | WFM discriminator at twice the channel rate (+4 to 6 dB SINAD near the FM threshold), IF noise reduction for FM (carrier-tracking, another +3 to 10 dB on weak stations), audio noise reduction for every mode (spectral MMSE-LSA with a minimum-statistics noise estimate), per-mode high-pass/low-pass filters (8th-order Butterworth, for removing CTCSS tones or reducing FM hiss) |
 | Audio | Output through miniaudio (WASAPI / CoreAudio / ALSA / PulseAudio, etc.), device selection, volume and mute |
 | Sources (plugins) | Signal generator (a virtual band for demos), IQ file playback (WAV / cu8 / cs8 / cs16 / cf32), rtl_tcp, SoapySDR\*, native RTL-SDR\* |
@@ -79,7 +79,7 @@ build/bin/
 
 ### Tests
 
-Headless tests check the DSP chain (the output tone of every demodulation mode, WFM stereo separation and weak-signal SINAD, SSB opposite-sideband rejection, rejection of a +50 dB station 600 kHz away, I/Q image removal, audio noise reduction, squelch, stream hooks, WAV reading and writing, and more).
+Headless tests check the DSP chain (the output tone of every demodulation mode, WFM stereo separation and weak-signal SINAD, SSB opposite-sideband rejection (also 100 Hz from the carrier), the AGC (no overshoot, threshold, hang), window leakage, rejection of a +50 dB station 600 kHz away, I/Q image removal, audio noise reduction, squelch, stream hooks, WAV reading and writing, and more).
 
 ```sh
 ctest --preset release

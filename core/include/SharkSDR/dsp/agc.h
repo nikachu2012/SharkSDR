@@ -1,35 +1,68 @@
 #pragma once
 
-#include <algorithm>
+#include <SharkSDR/export.h>
+#include <SharkSDR/types.h>
+
 #include <cmath>
+#include <cstdint>
+#include <vector>
 
 namespace SharkSDR::dsp {
 
-// Envelope following automatic gain control: fast attack, slow decay.
-class Agc {
+// Automatic gain control for the linear modes (SSB, CW, DSB), modelled on
+// the AGC of SDR# (which comes from CuteSDR):
+//
+// - The signal is delayed by 15 ms while its level is measured without the
+//   delay, so the gain is already down when a strong signal arrives: no
+//   overshoot (clipping, a click) at the start of every word.
+// - The level is the peak magnitude over a sliding 18 ms window, in dB. A
+//   fast "attack" average and a slow "decay" average follow it and the
+//   higher of the two sets the gain. With `hang` the decay average is held
+//   for the decay time after the signal drops, then released quickly.
+// - Below the threshold the gain stops rising, so the band noise between
+//   transmissions is not pulled up to full volume.
+class SHARKSDR_API Agc {
 public:
-    // attack/decay are time constants in seconds.
-    void configure(double sampleRate, double attack = 0.002, double decay = 0.4,
-                   float target = 0.3f, float maxGainDb = 90.0f) {
-        attack_ = float(1.0 - std::exp(-1.0 / (attack * sampleRate)));
-        decay_ = float(1.0 - std::exp(-1.0 / (decay * sampleRate)));
-        target_ = target;
-        maxGain_ = std::pow(10.0f, maxGainDb / 20.0f);
-    }
-    void reset() { level_ = 0.0f; }
+    struct Settings {
+        bool enabled = true;
+        bool hang = false;
+        double decay = 0.4;          // seconds
+        float thresholdDb = -90.0f;  // input level (dBFS) below which the gain stays fixed
+        float manualGainDb = 50.0f;  // gain while disabled
+        float target = 0.5f;         // output peak level
+    };
 
-    // Feed the magnitude of the current sample; returns the gain to apply.
-    float gain(float magnitude) {
-        if (magnitude > level_) level_ += attack_ * (magnitude - level_);
-        else level_ += decay_ * (magnitude - level_);
-        return std::min(target_ / std::max(level_, 1e-9f), maxGain_);
-    }
+    // Keeps the state unless the sample rate changes, so settings can be
+    // changed while a signal is being received.
+    void configure(double sampleRate, const Settings& settings);
+    void reset();
+
+    // Levels `data` in place; the output lags the input by delay() samples.
+    void process(Complex* data, size_t count);
+    size_t delay() const { return delayLine_.size(); }
+    float gainDb() const { return gainDb_; }
 
 private:
-    float attack_ = 0.01f, decay_ = 0.0001f;
-    float target_ = 0.3f;
-    float maxGain_ = 1e4f;
-    float level_ = 0.0f;
+    float slidingPeak(float levelDb);
+    float targetDb() const;
+
+    Settings settings_;
+    double rate_ = 0.0;
+    float attackRise_ = 1.0f, attackFall_ = 1.0f, decayRise_ = 1.0f, decayFall_ = 1.0f;
+    uint64_t hangSamples_ = 0;
+
+    std::vector<Complex> delayLine_;
+    size_t delayPos_ = 0;
+    // Sliding maximum: a queue of the samples that can still become the
+    // window's peak (decreasing values), as a ring buffer.
+    std::vector<uint64_t> peakIndex_;
+    std::vector<float> peakValue_;
+    size_t peakHead_ = 0, peakCount_ = 0, window_ = 1;
+    uint64_t sample_ = 0;
+
+    float attackDb_ = -200.0f, decayDb_ = -200.0f;
+    uint64_t hangCount_ = 0;
+    float gainDb_ = 0.0f;
 };
 
 // Limiter keeping audio within +-1: linear up to 0.8, then a smooth knee.

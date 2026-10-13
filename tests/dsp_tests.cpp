@@ -1,6 +1,7 @@
 // Headless checks of the DSP chain: every built-in demodulator is fed with a
 // synthetic signal and the frequency content of the audio is verified.
 
+#include <SharkSDR/dsp/agc.h>
 #include <SharkSDR/dsp/demodulators.h>
 #include <SharkSDR/dsp/fft.h>
 #include <SharkSDR/dsp/filter.h>
@@ -8,6 +9,7 @@
 #include <SharkSDR/dsp/noise_reduction.h>
 #include <SharkSDR/dsp/receiver.h>
 #include <SharkSDR/dsp/resampler.h>
+#include <SharkSDR/dsp/window.h>
 #include <SharkSDR/util/wav.h>
 
 #include <algorithm>
@@ -126,6 +128,28 @@ void testFft() {
         if (std::abs(x[i]) > std::abs(x[peak])) peak = i;
     check(peak == 100, "tone lands in bin 100 (got " + std::to_string(peak) + ")");
     check(std::fabs(std::abs(x[100]) / double(n) - 1.0) < 1e-3, "full scale tone has unit magnitude");
+
+    // Leakage of a tone between two bins, more than 10 bins away from it: the
+    // dynamic range of the spectrum next to a strong signal.
+    auto leakage = [](SharkSDR::dsp::WindowType type) {
+        const size_t m = 4096;
+        SharkSDR::dsp::Fft f(m);
+        const auto w = SharkSDR::dsp::makeWindow(type, m, true);
+        std::vector<Complex> y(m);
+        for (size_t i = 0; i < m; i++) y[i] = phasor(2.0 * kPi * 1000.37 * double(i) / double(m)) * w[i];
+        f.forward(y.data());
+        double top = 0.0, away = 0.0;
+        for (size_t k = 0; k < m; k++) {
+            const double p = std::norm(std::complex<double>(y[k]));
+            top = std::max(top, p);
+            if (k + 10 < 1000 || k > 1010) away = std::max(away, p);
+        }
+        return 10.0 * std::log10(away / top);
+    };
+    const double bh4 = leakage(SharkSDR::dsp::WindowType::BlackmanHarris);
+    const double bh7 = leakage(SharkSDR::dsp::WindowType::BlackmanHarris7);
+    check(bh4 < -90.0 && bh7 < -130.0, "leakage 10 bins from a tone: Blackman-Harris " + std::to_string(bh4) +
+                                           " dB, 7-term " + std::to_string(bh7) + " dB");
 }
 
 void testResampler() {
@@ -215,6 +239,87 @@ void testSsb() {
     const double l800 = toneAmplitude(lsb.left, 800.0, kAudioRate), l1500 = toneAmplitude(lsb.left, 1500.0, kAudioRate);
     check(l1500 > 0.05, "LSB hears the lower sideband tone");
     check(db(l1500 / l800) > 30.0, "LSB rejects the upper sideband (" + std::to_string(db(l1500 / l800)) + " dB)");
+
+    // Right next to the carrier: a tone 1 kHz into the wanted sideband and one
+    // 100 Hz into the other (fixed gain, so the AGC cannot level the residue up).
+    const nlohmann::json fixedGain = {{"agcOn", false}, {"gain", 30.0}};
+    for (const char* mode : {"USB", "LSB"}) {
+        const double side = mode[0] == 'U' ? 1.0 : -1.0;
+        auto twoTones = [&](double t) {
+            return phasor(2.0 * kPi * (kOffset + side * 1000.0) * t, 0.01) + phasor(2.0 * kPi * (kOffset - side * 100.0) * t, 0.01);
+        };
+        auto a = runReceiver(mode, 2800.0, twoTones, 2.0, 0.8, false, 0.0f, fixedGain);
+        const double rejection = db(toneAmplitude(a.left, 1000.0, kAudioRate) / toneAmplitude(a.left, 100.0, kAudioRate));
+        check(rejection > 80.0, std::string(mode) + " rejects the opposite sideband 100 Hz from the carrier (" +
+                                    std::to_string(rejection) + " dB)");
+    }
+}
+
+void testAgc() {
+    std::puts("AGC");
+    using SharkSDR::dsp::Agc;
+    const double rate = 24000.0;
+    // -110 dBFS noise, a -40 dBFS tone from 0.5 to 1.0 s, then noise again.
+    std::mt19937 rng(5);
+    std::normal_distribution<float> noise(0.0f, float(std::pow(10.0, -110.0 / 20.0) / std::sqrt(2.0)));
+    std::vector<Complex> input(size_t(2.0 * rate));
+    for (size_t i = 0; i < input.size(); i++) {
+        input[i] = Complex(noise(rng), noise(rng));
+        if (i >= size_t(0.5 * rate) && i < size_t(1.0 * rate)) input[i] += phasor(2.0 * kPi * 1000.0 * double(i) / rate, 0.01);
+    }
+    // Output and the gain at each 10 ms block.
+    auto run = [&](const Agc::Settings& s, std::vector<float>& gains) {
+        Agc agc;
+        agc.configure(rate, s);
+        std::vector<Complex> y = input;
+        for (size_t p = 0; p < y.size(); p += 240) {
+            agc.process(&y[p], 240);
+            gains.push_back(agc.gainDb());
+        }
+        return y;
+    };
+    auto gainAt = [](const std::vector<float>& gains, double t) { return gains[size_t(t * 100.0)]; };
+
+    Agc::Settings s;  // medium: 0.4 s decay, threshold -90 dBFS, output peaks at 0.5
+    std::vector<float> gains;
+    const auto y = run(s, gains);
+    float top = 0.0f;
+    double burst = 0.0;
+    for (size_t i = 0; i < y.size(); i++) top = std::max(top, std::abs(y[i]));
+    for (size_t i = size_t(0.6 * rate); i < size_t(0.95 * rate); i++) burst += std::abs(y[i]);
+    burst /= 0.35 * rate;
+    check(top < 0.51f, "a signal starting out of the noise does not overshoot (peak " + std::to_string(top) + ")");
+    check(std::fabs(burst - 0.5) < 0.01, "it is levelled to 0.5 (" + std::to_string(burst) + ")");
+    check(std::fabs(gainAt(gains, 0.4) - (db(0.5) + 90.0)) < 0.5,
+          "below the threshold the gain stays at its maximum (" + std::to_string(gainAt(gains, 0.4)) + " dB)");
+    const float during = gainAt(gains, 0.9);
+    check(gainAt(gains, 1.3) > during + 10.0f, "without hang the gain recovers after the signal (" + std::to_string(during) +
+                                                    " -> " + std::to_string(gainAt(gains, 1.3)) + " dB 0.3 s later)");
+
+    s.hang = true;
+    gains.clear();
+    run(s, gains);
+    check(std::fabs(gainAt(gains, 1.3) - gainAt(gains, 0.9)) < 1.5 && gainAt(gains, 1.6) > 80.0f,
+          "hang holds the gain for the decay time, then releases it (" + std::to_string(gainAt(gains, 0.9)) + " / " +
+              std::to_string(gainAt(gains, 1.3)) + " / " + std::to_string(gainAt(gains, 1.6)) + " dB)");
+
+    s.enabled = false;
+    s.manualGainDb = 30.0f;
+    gains.clear();
+    const auto fixed = run(s, gains);
+    check(std::fabs(std::abs(fixed[size_t(0.8 * rate)]) - 0.316f) < 0.01f, "AGC off: fixed gain");
+
+    // Through the receiver: USB tone bursts out of the noise.
+    std::mt19937 rng2(9);
+    std::normal_distribution<float> n2(0.0f, 2e-5f);
+    auto bursts = [&](double t) {
+        const bool on = (t >= 0.5 && t < 0.9) || (t >= 1.3 && t < 1.7);
+        return phasor(2.0 * kPi * (kOffset + 1000.0) * t, on ? (t < 1.0 ? 0.01 : 0.1) : 0.0) + Complex(n2(rng2), n2(rng2));
+    };
+    auto a = runReceiver("USB", 2800.0, bursts, 2.0, 0.0);
+    float onset = 0.0f;
+    for (float v : a.left) onset = std::max(onset, std::fabs(v));
+    check(onset < 0.55f, "USB: no overshoot at the start of a transmission (peak " + std::to_string(onset) + ")");
 }
 
 void testCw() {
@@ -608,6 +713,7 @@ int main() {
     testNfm();
     testAm();
     testSsb();
+    testAgc();
     testCw();
     testSquelch();
     testIfNoiseReduction();

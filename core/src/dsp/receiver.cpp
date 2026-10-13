@@ -15,6 +15,7 @@ constexpr double kDecimatorDb = 100.0;
 constexpr double kResamplerDb = 90.0;
 constexpr double kChannelDb = 90.0;
 constexpr double kAudioDb = 80.0;
+constexpr double kSquelchFade = 0.005;  // seconds
 }  // namespace
 
 Receiver::Receiver() = default;
@@ -134,12 +135,16 @@ void Receiver::rebuildChannelFilter() {
     if (!demod_ || channelRate_ <= 0.0) return;
 
     const double bw = std::clamp(bandwidth_, demod_->minBandwidth(), std::min(demod_->maxBandwidth(), channelRate_));
+    const BandShape shape = demod_->bandShape();
+    const double edge = shape == BandShape::Center ? bw * 0.5 : bw;  // outer edge of the pass band
+    const double transition = std::min(std::max(bw * 0.1, 50.0), std::max(10.0, 0.5 * channelRate_ - edge));
+    // Sidebands: the skirt on the carrier side lies within the wanted
+    // sideband, so the stop band starts right at 0 Hz and nothing of the
+    // opposite sideband leaks in, not even next to the carrier (SDR# also
+    // starts the pass band ~100 Hz above the carrier).
     double lo = -bw * 0.5, hi = bw * 0.5;
-    if (demod_->bandShape() == BandShape::Upper) lo = 0.0, hi = bw;
-    if (demod_->bandShape() == BandShape::Lower) lo = -bw, hi = 0.0;
-    const double edge = std::max(std::fabs(lo), std::fabs(hi));
-    const double maxTransition = std::max(10.0, 0.5 * channelRate_ - edge);
-    const double transition = std::min(std::max(bw * 0.1, 50.0), maxTransition);
+    if (shape == BandShape::Upper) lo = transition * 0.5, hi = bw;
+    if (shape == BandShape::Lower) lo = -bw, hi = -transition * 0.5;
 
     // 2) fractional resampling to the exact channel rate. Only the channel
     //    [-edge, edge] (plus the channel filter skirt) must stay alias free,
@@ -186,6 +191,7 @@ void Receiver::process(const Complex* in, size_t count, std::vector<Stereo>& aud
     const float db = powerToDb(float(power / double(m)));
     const float alpha = float(1.0 - std::exp(-double(m) / (channelRate_ * 0.05)));
     levelDb_ = levelDb_ <= -149.0f ? db : levelDb_ + alpha * (db - levelDb_);
+    const bool wasOpen = squelchOpen_;
     if (!squelchEnabled_) squelchOpen_ = true;
     else if (squelchOpen_) squelchOpen_ = levelDb_ >= squelchDb_ - 1.5f;
     else squelchOpen_ = levelDb_ >= squelchDb_;
@@ -193,7 +199,16 @@ void Receiver::process(const Complex* in, size_t count, std::vector<Stereo>& aud
     demodOut_.resize(m);
     if (bypass_) std::fill(demodOut_.begin(), demodOut_.end(), Stereo());
     else demod_->process(channel_.data(), m, demodOut_.data());
-    if (!squelchOpen_) std::fill(demodOut_.begin(), demodOut_.end(), Stereo());
+    // The squelch fades the audio in or out at the start of the block where
+    // it opens or closes instead of switching it (no clicks).
+    if (!wasOpen || !squelchOpen_) {
+        const size_t fade = std::min(m, size_t(kSquelchFade * channelRate_) + 1);
+        for (size_t i = 0; i < m; i++) {
+            const float rise = i < fade ? float(i + 1) / float(fade) : 1.0f;
+            const float g = wasOpen == squelchOpen_ ? 0.0f : squelchOpen_ ? rise : 1.0f - rise;
+            demodOut_[i] = demodOut_[i] * g;
+        }
+    }
     if (hooks_.demodulated) hooks_.demodulated(demodOut_.data(), m, channelRate_);
 
     // The cut-off follows the bandwidth (and e.g. the CW tone).

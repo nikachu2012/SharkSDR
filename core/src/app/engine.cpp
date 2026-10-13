@@ -14,6 +14,10 @@ namespace SharkSDR {
 
 namespace {
 constexpr size_t kMaxSpectrumQueue = 16;
+// Welch averaging of the spectrum: at most this many FFTs per frame, and at
+// most this many FFT points in all (8 x 8192), which bounds the CPU time.
+constexpr size_t kMaxSpectrumSegments = 16;
+constexpr size_t kSpectrumPointsPerFrame = 65536;
 
 bool isIqPoint(ProcessorType t) { return t == ProcessorType::RawIQ || t == ProcessorType::DecimatedAndFilteredIQ; }
 bool isAudioPoint(ProcessorType t) {
@@ -468,10 +472,14 @@ void Engine::processSpectrum(const Complex* data, size_t count, double rate, dou
         }
     }
     const size_t n = size_t(fftCfg_.fftSize);
-    if (rebuild || fftRing_.size() != n) {
-        fftRing_.assign(n, Complex());
+    const size_t hop = n / 2;
+    const size_t maxSegments = std::clamp<size_t>(kSpectrumPointsPerFrame / n, 1, kMaxSpectrumSegments);
+    const size_t capacity = n + hop * (maxSegments - 1);
+    if (rebuild || fftRing_.size() != capacity) {
+        fftRing_.assign(capacity, Complex());
         fftRingPos_ = 0;
         fftFilled_ = 0;
+        fftFresh_ = 0;
         fftAcc_ = 0.0;
     }
 
@@ -480,23 +488,34 @@ void Engine::processSpectrum(const Complex* data, size_t count, double rate, dou
     while (i < count) {
         const size_t need = std::max<size_t>(1, size_t(std::ceil(interval - fftAcc_)));
         const size_t take = std::min(count - i, need);
-        // Append to the ring (only the last n samples matter).
-        size_t start = take > n ? take - n : 0;
+        // Append to the ring (only the last `capacity` samples matter).
+        size_t start = take > capacity ? take - capacity : 0;
         for (size_t k = start; k < take; k++) {
             fftRing_[fftRingPos_] = data[i + k];
-            if (++fftRingPos_ == n) fftRingPos_ = 0;
+            if (++fftRingPos_ == capacity) fftRingPos_ = 0;
         }
-        fftFilled_ = std::min(n, fftFilled_ + take);
+        fftFilled_ = std::min(capacity, fftFilled_ + take);
+        fftFresh_ += take;
         i += take;
         fftAcc_ += double(take);
         if (fftAcc_ >= interval) {
             fftAcc_ -= interval;
-            // Hand the latest n samples to the worker, unless it is still busy.
+            // Hand the latest samples to the worker, unless it is still busy:
+            // as many half-overlapping FFTs as cover the samples since the
+            // last frame (at least one, which may reach back into it).
             if (fftFilled_ >= n && !spectrumBusy_.load()) {
-                jobSamples_.resize(n);
-                std::copy(fftRing_.begin() + std::ptrdiff_t(fftRingPos_), fftRing_.end(), jobSamples_.begin());
-                std::copy(fftRing_.begin(), fftRing_.begin() + std::ptrdiff_t(fftRingPos_),
-                          jobSamples_.begin() + std::ptrdiff_t(n - fftRingPos_));
+                const size_t fresh = std::min(std::max(fftFresh_, n), fftFilled_);
+                const size_t segments = 1 + (fresh - n) / hop;
+                const size_t len = n + (segments - 1) * hop;
+                const size_t first = (fftRingPos_ + capacity - len) % capacity;
+                jobSamples_.resize(len);
+                for (size_t k = 0, p = first; k < len; k++) {
+                    jobSamples_[k] = fftRing_[p];
+                    if (++p == capacity) p = 0;
+                }
+                jobFftSize_ = n;
+                jobSegments_ = segments;
+                fftFresh_ = 0;
                 jobRate_ = rate;
                 jobCenter_ = center;
                 jobWindow_ = fftCfg_.window;
@@ -523,7 +542,7 @@ void Engine::spectrumLoop() {
 }
 
 void Engine::computeSpectrumFrame() {
-    const size_t n = jobSamples_.size();
+    const size_t n = jobFftSize_;
     if (fft_.size() != n || fftWindow_.size() != n || fftWindowType_ != jobWindow_) {
         fft_.resize(n);
         fftWindow_ = dsp::makeWindow(jobWindow_, n, true);
@@ -532,21 +551,28 @@ void Engine::computeSpectrumFrame() {
         for (float w : fftWindow_) sum += w;
         fftWindowSum_ = float(sum);
     }
-    for (size_t k = 0; k < n; k++) jobSamples_[k] *= fftWindow_[k];
-    fft_.forward(jobSamples_.data());
-    if (iqCorrection_) iqBalancer_.update(jobSamples_.data(), n);
+    // Average power of the segments (Welch's method).
+    fftWork_.resize(n);
+    fftPower_.assign(n, 0.0f);
+    for (size_t s = 0; s < jobSegments_; s++) {
+        const Complex* x = &jobSamples_[s * (n / 2)];
+        for (size_t k = 0; k < n; k++) fftWork_[k] = x[k] * fftWindow_[k];
+        fft_.forward(fftWork_.data());
+        for (size_t k = 0; k < n; k++) fftPower_[k] += magSquared(fftWork_[k]);
+    }
+    if (iqCorrection_) iqBalancer_.update(fftWork_.data(), n);  // the latest segment
 
     SpectrumFrame frame;
     frame.db.resize(n);
     frame.sampleRate = jobRate_;
     frame.centerFrequency = jobCenter_;
     // Normalised so that a full-scale tone reads 0 dBFS.
-    const float norm = 1.0f / (fftWindowSum_ * fftWindowSum_);
+    const float norm = 1.0f / (fftWindowSum_ * fftWindowSum_ * float(std::max<size_t>(jobSegments_, 1)));
     const size_t half = n / 2;
     for (size_t k = 0; k < n; k++) {
         size_t src = k + half;
         if (src >= n) src -= n;
-        frame.db[k] = dsp::powerToDb(magSquared(jobSamples_[src]) * norm);
+        frame.db[k] = dsp::powerToDb(fftPower_[src] * norm);
     }
     std::lock_guard<std::mutex> lock(spectrumMutex_);
     spectrumFrames_.push_back(std::move(frame));

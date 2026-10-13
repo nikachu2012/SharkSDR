@@ -24,6 +24,7 @@ add_library(SharkSDR_core SHARED
     src/util/dynlib.cpp
 
     # DSP
+    src/dsp/agc.cpp
     src/dsp/fft.cpp
     src/dsp/window.cpp
     src/dsp/filter.cpp

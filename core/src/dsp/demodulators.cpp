@@ -412,19 +412,47 @@ public:
     }
 
     void process(const Complex* in, size_t count, Stereo* out) override {
-        bfoNco_.setFrequency(kind_ == Kind::Cw ? bfo_ : 0.0, channelRate());
-        for (size_t i = 0; i < count; i++) {
-            Complex x = in[i];
-            float g = agc_.gain(std::sqrt(magSquared(x)));
-            if (kind_ == Kind::Cw) x = cmul(x, bfoNco_.next());
-            out[i] = Stereo(softClip(x.real() * g));
+        work_.assign(in, in + count);
+        if (kind_ == Kind::Cw) {
+            bfoNco_.setFrequency(bfo_, channelRate());
+            bfoNco_.mix(work_.data(), count, work_.data());
         }
+        agc_.process(work_.data(), count);
+        for (size_t i = 0; i < count; i++) out[i] = Stereo(softClip(work_[i].real()));
     }
 
     void drawSettings() override {
+        static const char* const modes[] = {"Off", "Fast", "Medium", "Slow"};
+        bool changed = false;
+        int mode = agcOn_ ? agcSpeed_ + 1 : 0;
         ui::LabeledRow("AGC");
-        const char* speeds[] = {"Fast", "Medium", "Slow"};
-        if (ImGui::Combo("##agc", &agcSpeed_, speeds, 3)) configure();
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float hangW = ImGui::GetFrameHeight() + style.ItemInnerSpacing.x + ImGui::CalcTextSize("Hang").x;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - hangW - style.ItemSpacing.x);
+        if (ImGui::Combo("##agc", &mode, modes, IM_ARRAYSIZE(modes))) {
+            agcOn_ = mode > 0;
+            if (agcOn_) agcSpeed_ = mode - 1;
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!agcOn_);
+        changed |= ImGui::Checkbox("Hang", &hang_);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Holds the gain for the decay time after a signal drops, then releases it quickly:\n"
+                              "no noise surging up in the pauses of SSB / CW.");
+        if (agcOn_) {
+            ui::LabeledRow("Threshold");
+            changed |= ui::SliderFloat("##agcthr", &threshold_, -130.0f, -20.0f, "%.0f dBFS");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Signals weaker than this are not amplified any further.\n"
+                                  "Set it a little above the noise level (see Level) to keep\n"
+                                  "the band noise quiet between transmissions.");
+        } else {
+            ui::LabeledRow("Gain");
+            changed |= ui::SliderFloat("##agcgain", &manualGain_, 0.0f, 100.0f, "%.0f dB");
+        }
+        if (changed) configure();
         if (kind_ == Kind::Cw) {
             ui::LabeledRow("Tone");
             float bfo = float(bfo_);
@@ -433,27 +461,46 @@ public:
     }
 
     void loadState(const nlohmann::json& j) override {
+        agcOn_ = j.value("agcOn", agcOn_);
         agcSpeed_ = std::clamp(j.value("agc", agcSpeed_), 0, 2);
+        hang_ = j.value("agcHang", hang_);
+        threshold_ = std::clamp(j.value("agcThreshold", threshold_), -130.0f, -20.0f);
+        manualGain_ = std::clamp(j.value("gain", manualGain_), 0.0f, 100.0f);
         bfo_ = std::clamp(j.value("bfo", bfo_), 300.0, 1200.0);
         configure();
     }
     void saveState(nlohmann::json& j) const override {
+        j["agcOn"] = agcOn_;
         j["agc"] = agcSpeed_;
+        j["agcHang"] = hang_;
+        j["agcThreshold"] = threshold_;
+        j["gain"] = manualGain_;
         if (kind_ == Kind::Cw) j["bfo"] = bfo_;
     }
 
 private:
     void configure() {
-        const double decay[] = {0.1, 0.4, 1.5};
-        agc_.configure(channelRate(), 0.003, decay[agcSpeed_], 0.35f, 80.0f);
+        static constexpr double kDecay[] = {0.1, 0.4, 1.5};
+        Agc::Settings s;
+        s.enabled = agcOn_;
+        s.hang = hang_;
+        s.decay = kDecay[agcSpeed_];
+        s.thresholdDb = threshold_;
+        s.manualGainDb = manualGain_;
+        agc_.configure(channelRate(), s);
     }
 
     Kind kind_;
     double bandwidth_ = 2800.0;
     double bfo_ = 700.0;
+    bool agcOn_ = true;
     int agcSpeed_ = 1;
+    bool hang_ = false;
+    float threshold_ = -90.0f;
+    float manualGain_ = 50.0f;
     Agc agc_;
     Nco bfoNco_;
+    std::vector<Complex> work_;
 };
 
 // ---- RAW: I on the left channel, Q on the right ------------------------------
