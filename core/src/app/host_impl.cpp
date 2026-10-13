@@ -32,13 +32,26 @@ void HostImpl::registerSpectrumOverlay(std::function<void(const SpectrumOverlayC
 TapHandle HostImpl::addIqTap(IqTapCallback callback) { return engine_.addIqTap(std::move(callback), owner_); }
 TapHandle HostImpl::addAudioTap(AudioTapCallback callback) { return engine_.addAudioTap(std::move(callback), owner_); }
 void HostImpl::removeTap(TapHandle handle) { engine_.removeTap(handle); }
+TapHandle HostImpl::registerStreamHook(ProcessorType type, IqProcessor hook) {
+    return engine_.addStreamHook(type, std::move(hook), owner_);
+}
+TapHandle HostImpl::registerStreamHook(ProcessorType type, RealProcessor hook) {
+    return engine_.addStreamHook(type, std::move(hook), owner_);
+}
+TapHandle HostImpl::registerStreamHook(ProcessorType type, AudioProcessor hook) {
+    return engine_.addStreamHook(type, std::move(hook), owner_);
+}
+void HostImpl::setBypassDemodulation(bool bypass) { engine_.setBypassDemodulation(owner_, bypass); }
+bool HostImpl::bypassDemodulation() const { return engine_.bypassDemodulation(); }
 
 bool HostImpl::isRunning() const { return engine_.running(); }
 bool HostImpl::start() { return engine_.start(); }
 void HostImpl::stop() { engine_.stop(); }
 std::string HostImpl::sourceName() const { return engine_.currentSourceName(); }
+bool HostImpl::sourceTunable() const { return engine_.currentSource() && engine_.currentSource()->tunable(); }
 double HostImpl::sampleRate() const { return engine_.sampleRate(); }
 double HostImpl::centerFrequency() const { return engine_.centerFrequency(); }
+void HostImpl::setCenterFrequency(double hz) { engine_.setCenterFrequency(hz); }
 double HostImpl::frequency() const { return engine_.frequency(); }
 void HostImpl::setFrequency(double hz) { engine_.setFrequency(hz); }
 std::string HostImpl::mode() const { return engine_.mode(); }

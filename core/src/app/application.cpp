@@ -19,6 +19,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -412,6 +413,7 @@ void App::captureScreenshot(const fs::path& path) {
 int App::run(int argc, char** argv) {
     if (!parseArguments(argc, argv)) return 0;
     if (!options_.configDir.empty()) setConfigDirectoryOverride(options_.configDir);
+    if (options_.uiTest || options_.pluginReloadTest) setUserDataDirectoryOverride(configDirectory() / "data");
     logInfo("App", std::string("SharkSDR ") + versionString() + ", config: " + pathToUtf8(configDirectory()));
 
     loadConfig();
@@ -496,6 +498,26 @@ int App::run(int argc, char** argv) {
     shutdown();
     return uiTestFailures_ > 0 ? 2 : 0;
 }
+
+// What the stream hooks registered by the UI test saw (written on the DSP thread).
+struct App::HookProbe {
+    static constexpr OwnerId kOwner = 1 << 24;  // stands in for a plugin
+    static constexpr float kTone = 0.25f;       // amplitude written into MonitorAF
+    std::atomic<uint64_t> calls[6]{};           // per ProcessorType
+    std::atomic<double> rate[6]{};
+    std::atomic<double> channelFrequency{0.0};
+    std::atomic<double> demodEnergy{0.0};
+    std::atomic<float> outPeak{0.0f};  // after volume
+    double tonePhase = 0.0;            // DSP thread
+    // UI thread: snapshots taken when the bypass is set and the hooks are removed.
+    double energyAtBypass = 0.0;
+    uint64_t mpxAtBypass = 0, monitorAtBypass = 0, totalAtRemoval = 0;
+    uint64_t total() const {
+        uint64_t n = 0;
+        for (const auto& c : calls) n += c.load();
+        return n;
+    }
+};
 
 // Developer self test: injects mouse/keyboard events into ImGui (no real
 // input needed) and checks that the spectrum interactions change the state.
@@ -627,6 +649,100 @@ void App::uiTestStep() {
                    "volume " + std::to_string(engine_->volume()));
             engine_->setVolume(float(uiTestValue_));
             io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+            break;
+        // Stream hooks at every point, registered the way a decoder plugin would.
+        case 176: {
+            if (engine_->mode() != "WFM") engine_->setMode("WFM");
+            hookProbe_ = std::make_shared<HookProbe>();
+            auto probe = hookProbe_;
+            const OwnerId owner = HookProbe::kOwner;
+            auto note = [probe](const StreamInfo& info) {
+                probe->calls[int(info.type)]++;
+                probe->rate[int(info.type)] = info.sampleRate;
+            };
+            for (ProcessorType t : {ProcessorType::RawIQ, ProcessorType::DecimatedAndFilteredIQ})
+                engine_->addStreamHook(t, IqProcessor([probe, note](Complex*, size_t, const StreamInfo& info) {
+                    note(info);
+                    if (info.type == ProcessorType::DecimatedAndFilteredIQ) probe->channelFrequency = info.frequency;
+                }), owner);
+            engine_->addStreamHook(ProcessorType::FMMPX, RealProcessor([note](float*, size_t, const StreamInfo& info) { note(info); }),
+                                   owner);
+            engine_->addStreamHook(ProcessorType::DemodulatorOutput,
+                                   AudioProcessor([probe, note](Stereo* f, size_t n, const StreamInfo& info) {
+                                       note(info);
+                                       double e = 0.0;
+                                       for (size_t i = 0; i < n; i++) e += double(f[i].l) * f[i].l;
+                                       probe->demodEnergy = probe->demodEnergy.load() + e;
+                                   }),
+                                   owner);
+            engine_->addStreamHook(ProcessorType::FilteredAudioOutput,
+                                   AudioProcessor([note](Stereo*, size_t, const StreamInfo& info) { note(info); }), owner);
+            // Replace what is played with a tone, as a decoder plays its voice.
+            engine_->addStreamHook(ProcessorType::MonitorAF, AudioProcessor([probe, note](Stereo* f, size_t n, const StreamInfo& info) {
+                note(info);
+                for (size_t i = 0; i < n; i++) {
+                    f[i] = Stereo(HookProbe::kTone * float(std::sin(probe->tonePhase)));
+                    probe->tonePhase = std::fmod(probe->tonePhase + kTwoPi * 1000.0 / info.sampleRate, kTwoPi);
+                }
+            }), owner);
+            engine_->addAudioTap([probe](const Stereo* f, size_t n, double) {
+                float peak = probe->outPeak.load();
+                for (size_t i = 0; i < n; i++) peak = std::max(peak, std::fabs(f[i].l));
+                probe->outPeak = peak;
+            }, owner);
+            const TapHandle wrong =
+                engine_->addStreamHook(ProcessorType::MonitorAF, IqProcessor([](Complex*, size_t, const StreamInfo&) {}), owner);
+            report("a hook with the wrong sample type is refused", wrong == 0, "handle " + std::to_string(wrong));
+            break;
+        }
+        case 196: {
+            HookProbe& p = *hookProbe_;
+            static const char* const names[] = {"RawIQ", "DecimatedAndFilteredIQ", "FMMPX", "DemodulatorOutput",
+                                                "FilteredAudioOutput", "MonitorAF"};
+            const double audioRate = audio_->sampleRate();
+            const double expected[] = {engine_->sampleRate(), 250000.0, 250000.0, 250000.0, audioRate, audioRate};
+            bool ok = true;
+            std::string detail;
+            for (int i = 0; i < 6; i++) {
+                ok = ok && p.calls[i] > 0 && p.rate[i] == expected[i];
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "%s%s %llux %.0f Hz", i ? ", " : "", names[i],
+                              (unsigned long long)p.calls[i].load(), p.rate[i].load());
+                detail += buf;
+            }
+            report("stream hooks run at every point, at their sample rates", ok, detail);
+            report("DecimatedAndFilteredIQ is centred on the VFO", std::fabs(p.channelFrequency - engine_->frequency()) < 1.0,
+                   ui::formatFrequency(p.channelFrequency) + " / VFO " + ui::formatFrequency(engine_->frequency()));
+            report("DemodulatorOutput carries the demodulated audio", p.demodEnergy > 0.0,
+                   "energy " + std::to_string(p.demodEnergy.load()));
+            const float gain = engine_->muted() ? 0.0f : engine_->volume() * engine_->volume();
+            const float want = HookProbe::kTone * gain;
+            report("audio written in MonitorAF is played, with the volume applied after it",
+                   std::fabs(p.outPeak - want) <= 0.01f * HookProbe::kTone,
+                   "peak " + std::to_string(p.outPeak.load()) + ", expected " + std::to_string(want));
+            engine_->setBypassDemodulation(HookProbe::kOwner, true);
+            p.energyAtBypass = p.demodEnergy;
+            p.mpxAtBypass = p.calls[int(ProcessorType::FMMPX)];
+            p.monitorAtBypass = p.calls[int(ProcessorType::MonitorAF)];
+            break;
+        }
+        case 206: {
+            HookProbe& p = *hookProbe_;
+            const uint64_t mpx = p.calls[int(ProcessorType::FMMPX)], monitor = p.calls[int(ProcessorType::MonitorAF)];
+            report("bypassing the demodulator silences it, MonitorAF still runs",
+                   engine_->bypassDemodulation() && p.demodEnergy == p.energyAtBypass && mpx == p.mpxAtBypass &&
+                       monitor > p.monitorAtBypass,
+                   "FMMPX " + std::to_string(mpx - p.mpxAtBypass) + " calls, MonitorAF " +
+                       std::to_string(monitor - p.monitorAtBypass) + " calls since");
+            removeOwner(HookProbe::kOwner);  // what unloading the plugin does
+            p.totalAtRemoval = p.total();
+            break;
+        }
+        case 214:
+            report("removed hooks are not called again and the bypass is released",
+                   hookProbe_->total() == hookProbe_->totalAtRemoval && !engine_->bypassDemodulation(),
+                   std::to_string(hookProbe_->total() - hookProbe_->totalAtRemoval) + " calls after removal");
+            hookProbe_.reset();
             break;
         // Ctrl+R twice: handled by the Recorder plugin (start, then stop ~1 s later).
         case 100:
@@ -1038,6 +1154,11 @@ void App::drawSourcePanel() {
     bool dc = engine_->dcBlock();
     if (ImGui::Checkbox("Remove DC offset", &dc)) engine_->setDcBlock(dc);
     ui::SameLineColumn();
+    bool iq = engine_->iqCorrection();
+    if (ImGui::Checkbox("IQ correction", &iq)) engine_->setIqCorrection(iq);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Removes the mirror images of strong stations caused by I/Q gain and phase errors\n"
+                          "(zero-IF tuners such as the E4000 and FC0012/FC0013)");
     bool swap = engine_->swapIq();
     if (ImGui::Checkbox("Swap I/Q", &swap)) engine_->setSwapIq(swap);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Mirror the spectrum (for hardware with swapped I and Q)");
@@ -1117,6 +1238,13 @@ void App::drawRadioPanel() {
                           "frequencies, so 6-10 kHz makes weak broadcast stations much quieter.");
     ImGui::BeginDisabled(!filters.lowpass);
     filtersChanged |= ui::SliderFloat("##lpf", &filters.lowpassHz, 500.0f, 20000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic);
+    ImGui::EndDisabled();
+    filtersChanged |= ui::CheckboxRow("Audio NR", &filters.noiseReduction);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Noise reduction: learns the background hiss (in about a second) and removes it\n"
+                          "from the audio. The slider sets how far the noise is pushed down.");
+    ImGui::BeginDisabled(!filters.noiseReduction);
+    filtersChanged |= ui::SliderFloat("##nr", &filters.noiseReductionDb, 3.0f, 30.0f, "%.0f dB");
     ImGui::EndDisabled();
     if (filtersChanged) engine_->setAudioFilters(filters);
 

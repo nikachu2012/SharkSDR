@@ -8,11 +8,30 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <type_traits>
 
 namespace SharkSDR {
 
 namespace {
 constexpr size_t kMaxSpectrumQueue = 16;
+
+bool isIqPoint(ProcessorType t) { return t == ProcessorType::RawIQ || t == ProcessorType::DecimatedAndFilteredIQ; }
+bool isAudioPoint(ProcessorType t) {
+    return t == ProcessorType::DemodulatorOutput || t == ProcessorType::FilteredAudioOutput || t == ProcessorType::MonitorAF;
+}
+}  // namespace
+
+// DSP thread.
+template <typename T>
+void Engine::runStreamHooks(ProcessorType type, T* data, size_t count, double sampleRate, double frequency) {
+    const StreamInfo info{type, sampleRate, frequency};
+    std::lock_guard<std::mutex> lock(tapsMutex_);
+    for (auto& h : streamHooks_) {
+        if (h.type != type) continue;
+        if constexpr (std::is_same_v<T, Complex>) h.iq(data, count, info);
+        else if constexpr (std::is_same_v<T, float>) h.real(data, count, info);
+        else h.audio(data, count, info);
+    }
 }
 
 Engine::Engine(AudioOutput& audio) : audio_(audio) {
@@ -20,7 +39,23 @@ Engine::Engine(AudioOutput& audio) : audio_(audio) {
     block_.resize(size_t(1) << 18);
     for (const auto& name : dsp::builtinDemodulatorNames())
         registerDemodulator(name, [name] { return dsp::createBuiltinDemodulator(name); }, kCoreOwner);
+
+    // The stream hooks inside the receive chain (RawIQ and MonitorAF run in processBlock()).
+    dsp::Receiver::StreamHooks hooks;
+    hooks.channel = [this](Complex* s, size_t n, double rate) {
+        runStreamHooks(ProcessorType::DecimatedAndFilteredIQ, s, n, rate, blockVfo_);
+    };
+    hooks.mpx = [this](float* s, size_t n, double rate) { runStreamHooks(ProcessorType::FMMPX, s, n, rate, 0.0); };
+    hooks.demodulated = [this](Stereo* s, size_t n, double rate) {
+        runStreamHooks(ProcessorType::DemodulatorOutput, s, n, rate, 0.0);
+    };
+    hooks.audio = [this](Stereo* s, size_t n, double rate) {
+        runStreamHooks(ProcessorType::FilteredAudioOutput, s, n, rate, 0.0);
+    };
+    receiver_.setStreamHooks(std::move(hooks));
+
     thread_ = std::thread([this] { dspLoop(); });
+    spectrumThread_ = std::thread([this] { spectrumLoop(); });
 }
 
 Engine::~Engine() {
@@ -28,6 +63,11 @@ Engine::~Engine() {
     quit_ = true;
     dataCv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    {
+        std::lock_guard<std::mutex> lock(jobMutex_);
+        jobCv_.notify_all();
+    }
+    if (spectrumThread_.joinable()) spectrumThread_.join();
 }
 
 // ---- sources ----------------------------------------------------------------------
@@ -303,6 +343,7 @@ void Engine::applyMode(ModeEntry& entry) {
     receiver_.setBandwidth(hz);
     const AudioFilterSettings f = audioFiltersFor(mode_);
     receiver_.setAudioFilters(f.highpass, f.highpassHz, f.lowpass, f.lowpassHz);
+    receiver_.setNoiseReduction(f.noiseReduction, f.noiseReductionDb);
 }
 
 AudioFilterSettings Engine::audioFiltersFor(const std::string& mode) const {
@@ -323,8 +364,10 @@ void Engine::setAudioFilters(const AudioFilterSettings& settings) {
     AudioFilterSettings f = settings;
     f.highpassHz = std::clamp(f.highpassHz, 10.0f, 5000.0f);
     f.lowpassHz = std::clamp(f.lowpassHz, 200.0f, 23000.0f);
+    f.noiseReductionDb = std::clamp(f.noiseReductionDb, 3.0f, 30.0f);
     audioFilters_[mode_] = f;
     receiver_.setAudioFilters(f.highpass, f.highpassHz, f.lowpass, f.lowpassHz);
+    receiver_.setNoiseReduction(f.noiseReduction, f.noiseReductionDb);
 }
 
 bool Engine::setMode(const std::string& name) {
@@ -426,13 +469,7 @@ void Engine::processSpectrum(const Complex* data, size_t count, double rate, dou
     }
     const size_t n = size_t(fftCfg_.fftSize);
     if (rebuild || fftRing_.size() != n) {
-        fft_.resize(n);
-        fftWindow_ = dsp::makeWindow(fftCfg_.window, n, true);
-        double sum = 0.0;
-        for (float w : fftWindow_) sum += w;
-        fftWindowSum_ = float(sum);
         fftRing_.assign(n, Complex());
-        fftBuf_.resize(n);
         fftRingPos_ = 0;
         fftFilled_ = 0;
         fftAcc_ = 0.0;
@@ -454,31 +491,62 @@ void Engine::processSpectrum(const Complex* data, size_t count, double rate, dou
         fftAcc_ += double(take);
         if (fftAcc_ >= interval) {
             fftAcc_ -= interval;
-            if (fftFilled_ >= n) computeSpectrumFrame(rate, center);
+            // Hand the latest n samples to the worker, unless it is still busy.
+            if (fftFilled_ >= n && !spectrumBusy_.load()) {
+                jobSamples_.resize(n);
+                std::copy(fftRing_.begin() + std::ptrdiff_t(fftRingPos_), fftRing_.end(), jobSamples_.begin());
+                std::copy(fftRing_.begin(), fftRing_.begin() + std::ptrdiff_t(fftRingPos_),
+                          jobSamples_.begin() + std::ptrdiff_t(n - fftRingPos_));
+                jobRate_ = rate;
+                jobCenter_ = center;
+                jobWindow_ = fftCfg_.window;
+                spectrumBusy_ = true;
+                std::lock_guard<std::mutex> lock(jobMutex_);
+                jobReady_ = true;
+                jobCv_.notify_one();
+            }
         }
     }
 }
 
-void Engine::computeSpectrumFrame(double rate, double center) {
-    const size_t n = fftRing_.size();
-    for (size_t k = 0; k < n; k++) {
-        size_t idx = fftRingPos_ + k;
-        if (idx >= n) idx -= n;
-        fftBuf_[k] = fftRing_[idx] * fftWindow_[k];
+void Engine::spectrumLoop() {
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(jobMutex_);
+            jobCv_.wait(lock, [&] { return jobReady_ || quit_.load(); });
+            if (quit_) break;
+            jobReady_ = false;
+        }
+        computeSpectrumFrame();
+        spectrumBusy_ = false;
     }
-    fft_.forward(fftBuf_.data());
+}
+
+void Engine::computeSpectrumFrame() {
+    const size_t n = jobSamples_.size();
+    if (fft_.size() != n || fftWindow_.size() != n || fftWindowType_ != jobWindow_) {
+        fft_.resize(n);
+        fftWindow_ = dsp::makeWindow(jobWindow_, n, true);
+        fftWindowType_ = jobWindow_;
+        double sum = 0.0;
+        for (float w : fftWindow_) sum += w;
+        fftWindowSum_ = float(sum);
+    }
+    for (size_t k = 0; k < n; k++) jobSamples_[k] *= fftWindow_[k];
+    fft_.forward(jobSamples_.data());
+    if (iqCorrection_) iqBalancer_.update(jobSamples_.data(), n);
 
     SpectrumFrame frame;
     frame.db.resize(n);
-    frame.sampleRate = rate;
-    frame.centerFrequency = center;
+    frame.sampleRate = jobRate_;
+    frame.centerFrequency = jobCenter_;
     // Normalised so that a full-scale tone reads 0 dBFS.
     const float norm = 1.0f / (fftWindowSum_ * fftWindowSum_);
     const size_t half = n / 2;
     for (size_t k = 0; k < n; k++) {
         size_t src = k + half;
         if (src >= n) src -= n;
-        frame.db[k] = dsp::powerToDb(magSquared(fftBuf_[src]) * norm);
+        frame.db[k] = dsp::powerToDb(magSquared(jobSamples_[src]) * norm);
     }
     std::lock_guard<std::mutex> lock(spectrumMutex_);
     spectrumFrames_.push_back(std::move(frame));
@@ -501,6 +569,42 @@ TapHandle Engine::addAudioTap(AudioTapCallback cb, OwnerId owner) {
     return h;
 }
 
+TapHandle Engine::addStreamHook(ProcessorType type, IqProcessor hook, OwnerId owner) {
+    StreamHook h;
+    h.type = type;
+    h.iq = std::move(hook);
+    return addStreamHook(std::move(h), owner);
+}
+
+TapHandle Engine::addStreamHook(ProcessorType type, RealProcessor hook, OwnerId owner) {
+    StreamHook h;
+    h.type = type;
+    h.real = std::move(hook);
+    return addStreamHook(std::move(h), owner);
+}
+
+TapHandle Engine::addStreamHook(ProcessorType type, AudioProcessor hook, OwnerId owner) {
+    StreamHook h;
+    h.type = type;
+    h.audio = std::move(hook);
+    return addStreamHook(std::move(h), owner);
+}
+
+TapHandle Engine::addStreamHook(StreamHook hook, OwnerId owner) {
+    const bool matches = hook.iq ? isIqPoint(hook.type)
+                         : hook.real ? hook.type == ProcessorType::FMMPX
+                                     : hook.audio && isAudioPoint(hook.type);
+    if (!matches) {
+        logError("Engine", "Stream hook ignored: its sample type does not match the point (or it is empty)");
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(tapsMutex_);
+    hook.handle = nextTap_++;
+    hook.owner = owner;
+    streamHooks_.push_back(std::move(hook));
+    return streamHooks_.back().handle;
+}
+
 void Engine::removeTap(TapHandle handle) {
     std::lock_guard<std::mutex> lock(tapsMutex_);
     iqTaps_.erase(std::remove_if(iqTaps_.begin(), iqTaps_.end(), [&](const IqTap& t) { return t.handle == handle; }),
@@ -508,15 +612,36 @@ void Engine::removeTap(TapHandle handle) {
     audioTaps_.erase(
         std::remove_if(audioTaps_.begin(), audioTaps_.end(), [&](const AudioTap& t) { return t.handle == handle; }),
         audioTaps_.end());
+    streamHooks_.erase(
+        std::remove_if(streamHooks_.begin(), streamHooks_.end(), [&](const StreamHook& h) { return h.handle == handle; }),
+        streamHooks_.end());
 }
 
 void Engine::removeTaps(OwnerId owner) {
-    std::lock_guard<std::mutex> lock(tapsMutex_);
-    iqTaps_.erase(std::remove_if(iqTaps_.begin(), iqTaps_.end(), [&](const IqTap& t) { return t.owner == owner; }),
-                  iqTaps_.end());
-    audioTaps_.erase(
-        std::remove_if(audioTaps_.begin(), audioTaps_.end(), [&](const AudioTap& t) { return t.owner == owner; }),
-        audioTaps_.end());
+    {
+        std::lock_guard<std::mutex> lock(tapsMutex_);
+        iqTaps_.erase(std::remove_if(iqTaps_.begin(), iqTaps_.end(), [&](const IqTap& t) { return t.owner == owner; }),
+                      iqTaps_.end());
+        audioTaps_.erase(
+            std::remove_if(audioTaps_.begin(), audioTaps_.end(), [&](const AudioTap& t) { return t.owner == owner; }),
+            audioTaps_.end());
+        streamHooks_.erase(
+            std::remove_if(streamHooks_.begin(), streamHooks_.end(), [&](const StreamHook& h) { return h.owner == owner; }),
+            streamHooks_.end());
+    }
+    setBypassDemodulation(owner, false);
+}
+
+void Engine::setBypassDemodulation(OwnerId owner, bool bypass) {
+    std::lock_guard<std::recursive_mutex> lock(chainMutex_);
+    if (bypass) bypassOwners_.insert(owner);
+    else bypassOwners_.erase(owner);
+    receiver_.setBypassDemodulation(!bypassOwners_.empty());
+}
+
+bool Engine::bypassDemodulation() const {
+    std::lock_guard<std::recursive_mutex> lock(chainMutex_);
+    return !bypassOwners_.empty();
 }
 
 // ---- DSP thread -------------------------------------------------------------------
@@ -568,7 +693,9 @@ void Engine::processBlock(Complex* data, size_t count) {
         }
         dcBlocker_.process(data, count);
     }
+    if (iqCorrection_) iqBalancer_.process(data, count);  // measured on the spectrum, see computeSpectrumFrame()
 
+    runStreamHooks(ProcessorType::RawIQ, data, count, rate, center);
     {
         std::lock_guard<std::mutex> lock(tapsMutex_);
         for (auto& t : iqTaps_) t.cb(data, count, rate, center);
@@ -579,13 +706,15 @@ void Engine::processBlock(Complex* data, size_t count) {
     audioBuf_.clear();
     {
         std::lock_guard<std::recursive_mutex> lock(chainMutex_);
+        blockVfo_ = vfo_.load();
         receiver_.setInputRate(rate);
         receiver_.setAudioRate(audio_.sampleRate());
-        receiver_.setOffset(vfo_.load() - center);
-        receiver_.process(data, count, audioBuf_);
+        receiver_.setOffset(blockVfo_ - center);
+        receiver_.process(data, count, audioBuf_);  // runs the hooks from DecimatedAndFilteredIQ to FilteredAudioOutput
         signalLevel_ = receiver_.signalLevel();
         squelchOpen_ = receiver_.squelchOpen();
     }
+    if (!audioBuf_.empty()) runStreamHooks(ProcessorType::MonitorAF, audioBuf_.data(), audioBuf_.size(), audio_.sampleRate(), 0.0);
 
     const float v = volume_.load();
     const float gain = muted_ ? 0.0f : v * v;
@@ -607,6 +736,7 @@ void Engine::loadState(const nlohmann::json& j) {
     centerTuning_ = j.value("centerTuning", centerTuning_);
     dcBlock_ = j.value("dcBlock", dcBlock_.load());
     swapIq_ = j.value("swapIq", swapIq_.load());
+    iqCorrection_ = j.value("iqCorrection", iqCorrection_.load());
     volume_ = std::clamp(j.value("volume", volume_.load()), 0.0f, 1.0f);
     muted_ = j.value("muted", muted_.load());
     if (j.contains("bandwidths") && j["bandwidths"].is_object())
@@ -623,6 +753,8 @@ void Engine::loadState(const nlohmann::json& j) {
             f.highpassHz = v.value("highpassHz", f.highpassHz);
             f.lowpass = v.value("lowpass", f.lowpass);
             f.lowpassHz = v.value("lowpassHz", f.lowpassHz);
+            f.noiseReduction = v.value("noiseReduction", f.noiseReduction);
+            f.noiseReductionDb = std::clamp(v.value("noiseReductionDb", f.noiseReductionDb), 3.0f, 30.0f);
             audioFilters_[mode] = f;
         }
     }
@@ -665,6 +797,7 @@ void Engine::saveState(nlohmann::json& j) {
     j["centerTuning"] = centerTuning_;
     j["dcBlock"] = dcBlock_.load();
     j["swapIq"] = swapIq_.load();
+    j["iqCorrection"] = iqCorrection_.load();
     j["volume"] = volume_.load();
     j["muted"] = muted_.load();
     j["source"] = current_ ? current_->name() : preferredSource_;
@@ -684,7 +817,12 @@ void Engine::saveState(nlohmann::json& j) {
         j["snaps"] = snaps_;
         nlohmann::json filters = nlohmann::json::object();
         for (const auto& [mode, f] : audioFilters_)
-            filters[mode] = {{"highpass", f.highpass}, {"highpassHz", f.highpassHz}, {"lowpass", f.lowpass}, {"lowpassHz", f.lowpassHz}};
+            filters[mode] = {{"highpass", f.highpass},
+                             {"highpassHz", f.highpassHz},
+                             {"lowpass", f.lowpass},
+                             {"lowpassHz", f.lowpassHz},
+                             {"noiseReduction", f.noiseReduction},
+                             {"noiseReductionDb", f.noiseReductionDb}};
         j["audioFilters"] = filters;
     }
     SpectrumSettings ss = spectrumSettings();

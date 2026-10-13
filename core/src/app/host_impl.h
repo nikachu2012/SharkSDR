@@ -26,13 +26,20 @@ public:
     TapHandle addIqTap(IqTapCallback callback) override;
     TapHandle addAudioTap(AudioTapCallback callback) override;
     void removeTap(TapHandle handle) override;
+    TapHandle registerStreamHook(ProcessorType type, IqProcessor hook) override;
+    TapHandle registerStreamHook(ProcessorType type, RealProcessor hook) override;
+    TapHandle registerStreamHook(ProcessorType type, AudioProcessor hook) override;
+    void setBypassDemodulation(bool bypass) override;
+    bool bypassDemodulation() const override;
 
     bool isRunning() const override;
     bool start() override;
     void stop() override;
     std::string sourceName() const override;
+    bool sourceTunable() const override;
     double sampleRate() const override;
     double centerFrequency() const override;
+    void setCenterFrequency(double hz) override;
     double frequency() const override;
     void setFrequency(double hz) override;
     std::string mode() const override;

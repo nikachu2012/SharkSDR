@@ -1,5 +1,5 @@
 // Minimal example plugin: a sidebar panel, an entry in the "Tools" menu,
-// a floating window and an audio tap. Use it as a template.
+// a floating window and a stream hook. Use it as a template.
 
 #include <SharkSDR/plugin.h>
 #include <SharkSDR/ui/widgets.h>
@@ -28,12 +28,15 @@ public:
         // 3) A per-frame callback to draw our own window.
         host.registerFrameCallback([this] { drawWindow(); });
 
-        // 4) An audio tap (runs on the DSP thread: keep it short, no locks needed for atomics).
-        host.addAudioTap([this](const SharkSDR::Stereo* frames, size_t count, double) {
-            float peak = 0.0f;
-            for (size_t i = 0; i < count; i++) peak = std::max(peak, std::fabs(frames[i].l));
-            audioPeak_ = std::max(peak, audioPeak_.load() * 0.9f);
-        });
+        // 4) A stream hook on the audio being played, before mute and volume (runs on
+        //    the DSP thread: keep it short, no locks needed for atomics). A decoder
+        //    would write its own audio into `frames` here.
+        host.registerStreamHook(SharkSDR::ProcessorType::MonitorAF,
+                                [this](SharkSDR::Stereo* frames, size_t count, const SharkSDR::StreamInfo&) {
+                                    float peak = 0.0f;
+                                    for (size_t i = 0; i < count; i++) peak = std::max(peak, std::fabs(frames[i].l));
+                                    audioPeak_ = std::max(peak, audioPeak_.load() * 0.9f);
+                                });
     }
 
     void shutdown() override { host_->config()["showWindow"] = showWindow_; }
@@ -74,4 +77,4 @@ private:
 }  // namespace
 
 SHARKSDR_PLUGIN(HelloPlugin, "Hello Example", "1.0.0", "SharkSDR",
-                "Template plugin: sidebar panel, Tools menu entry, own window and an audio tap.")
+                "Template plugin: sidebar panel, Tools menu entry, own window and a stream hook.")

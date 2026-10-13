@@ -16,12 +16,30 @@ public:
         rate_ = sampleRate;
         double w = sampleRate > 0.0 ? kTwoPi * hz / sampleRate : 0.0;
         step_ = Complex(float(std::cos(w)), float(std::sin(w)));
+        step4_ = Complex(float(std::cos(4.0 * w)), float(std::sin(4.0 * w)));
     }
     double frequency() const { return freq_; }
 
     void mix(const Complex* in, size_t count, Complex* out) {
-        Complex ph = phase_;
-        for (size_t i = 0; i < count; i++) {
+        // Four phasors one sample apart, each advanced by four steps: the
+        // multiplications no longer wait for each other.
+        Complex p0 = phase_;
+        Complex p1 = cmul(p0, step_);
+        Complex p2 = cmul(p1, step_);
+        Complex p3 = cmul(p2, step_);
+        size_t i = 0;
+        for (; i + 4 <= count; i += 4) {
+            out[i] = cmul(in[i], p0);
+            out[i + 1] = cmul(in[i + 1], p1);
+            out[i + 2] = cmul(in[i + 2], p2);
+            out[i + 3] = cmul(in[i + 3], p3);
+            p0 = cmul(p0, step4_);
+            p1 = cmul(p1, step4_);
+            p2 = cmul(p2, step4_);
+            p3 = cmul(p3, step4_);
+        }
+        Complex ph = p0;
+        for (; i < count; i++) {
             out[i] = cmul(in[i], ph);
             ph = cmul(ph, step_);
         }
@@ -45,6 +63,7 @@ public:
 private:
     Complex phase_{1.0f, 0.0f};
     Complex step_{1.0f, 0.0f};
+    Complex step4_{1.0f, 0.0f};
     double freq_ = 0.0;
     double rate_ = 0.0;
     int counter_ = 0;

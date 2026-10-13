@@ -59,6 +59,7 @@ target_include_directories(SharkSDR_core
         ${IMGUI_DIR}/backends
         ${miniaudio_SOURCE_DIR})
 
+target_compile_features(SharkSDR_core PUBLIC cxx_std_17)  # also for plugins built against the SDK
 target_compile_definitions(SharkSDR_core
     PUBLIC IMGUI_DEFINE_MATH_OPERATORS
     PRIVATE SHARKSDR_CORE_BUILD SHARKSDR_VERSION_STRING="${PROJECT_VERSION}")

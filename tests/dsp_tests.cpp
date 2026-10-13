@@ -3,12 +3,16 @@
 
 #include <SharkSDR/dsp/demodulators.h>
 #include <SharkSDR/dsp/fft.h>
+#include <SharkSDR/dsp/filter.h>
+#include <SharkSDR/dsp/math.h>
 #include <SharkSDR/dsp/noise_reduction.h>
 #include <SharkSDR/dsp/receiver.h>
 #include <SharkSDR/dsp/resampler.h>
 #include <SharkSDR/util/wav.h>
 
+#include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <filesystem>
 #include <functional>
@@ -274,6 +278,8 @@ void testIfNoiseReduction() {
     auto weakOff = runReceiver("WFM", 150e3, noisyWfm(7.0, 1), 1.6, 0.6, false, 0.0f, off);
     auto weakNr = runReceiver("WFM", 150e3, noisyWfm(7.0, 1), 1.6, 0.6, false, 0.0f, normal);
     const double a = sinadDb(weakOff.left, 1000.0, kAudioRate), b = sinadDb(weakNr.left, 1000.0, kAudioRate);
+    // 30 dB with the discriminator at the channel rate; ~35 dB at twice that rate.
+    check(a > 33.0, "weak WFM (CNR 7 dB) without IF NR: SINAD " + std::to_string(a) + " dB (oversampled discriminator)");
     check(b > a + 5.0, "weak WFM (CNR 7 dB): SINAD " + std::to_string(a) + " -> " + std::to_string(b) + " dB");
     auto strongOff = runReceiver("WFM", 150e3, noisyWfm(40.0, 2), 1.6, 0.6, false, 0.0f, off);
     auto strongNr = runReceiver("WFM", 150e3, noisyWfm(40.0, 2), 1.6, 0.6, false, 0.0f, normal);
@@ -317,6 +323,262 @@ void testAudioFilters() {
           "receiver low-pass keeps the 1 kHz tone");
 }
 
+// Amplitude of the complex component at `hz` (single-bin DFT, Hann window).
+double complexToneAmplitude(const std::vector<Complex>& x, double hz, double rate) {
+    std::complex<double> acc = 0.0;
+    double wsum = 0.0;
+    const size_t n = x.size();
+    for (size_t i = 0; i < n; i++) {
+        const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * double(i) / double(n - 1));
+        acc += std::complex<double>(x[i]) * w * std::polar(1.0, -2.0 * kPi * hz * double(i) / rate);
+        wsum += w;
+    }
+    return std::abs(acc) / wsum;
+}
+
+void testHalfBand() {
+    std::puts("Half-band filters");
+    auto tone = [](double hz, double rate, size_t n) {
+        std::vector<Complex> x(n);
+        for (size_t i = 0; i < n; i++) x[i] = phasor(2.0 * kPi * hz * double(i) / rate);
+        return x;
+    };
+    // 1.2 MHz -> 600 kHz keeping +-100 kHz: 520 kHz would alias to -80 kHz.
+    auto decimate = [](std::vector<Complex> x) {
+        SharkSDR::dsp::HalfBandDecimator<Complex> d;
+        d.configure(100e3, 1.2e6, 100.0);
+        x.resize(d.process(x.data(), x.size(), x.data()));
+        return std::vector<Complex>(x.begin() + 1000, x.end());
+    };
+    const double pass = complexToneAmplitude(decimate(tone(50e3, 1.2e6, 60000)), 50e3, 600e3);
+    const double alias = complexToneAmplitude(decimate(tone(520e3, 1.2e6, 60000)), -80e3, 600e3);
+    check(std::fabs(db(pass)) < 0.01, "decimator passes 50 kHz (" + std::to_string(db(pass)) + " dB)");
+    check(db(alias) < -95.0, "decimator removes what would alias into the pass band (" + std::to_string(db(alias)) + " dB)");
+
+    // 300 kHz -> 600 kHz: the image of 50 kHz is at -250 kHz.
+    SharkSDR::dsp::HalfBandInterpolator<Complex> up;
+    up.configure(100e3, 600e3, 90.0);
+    const auto in = tone(50e3, 300e3, 30000);
+    std::vector<Complex> out(2 * in.size());
+    up.process(in.data(), in.size(), out.data());
+    out.erase(out.begin(), out.begin() + 2000);
+    check(std::fabs(db(complexToneAmplitude(out, 50e3, 600e3))) < 0.01, "interpolator keeps 50 kHz");
+    const double image = complexToneAmplitude(out, -250e3, 600e3);
+    check(db(image) < -85.0, "interpolator removes the image (" + std::to_string(db(image)) + " dB)");
+}
+
+void testSelectivity() {
+    std::puts("Selectivity");
+    // Target (1 kHz, full deviation) and a 50 dB stronger station 600 kHz away
+    // with a busy programme: that offset folds onto the target in the
+    // decimator, so it is only kept out by its stop-band.
+    double p1 = 0.0, p2 = 0.0, lastT = 0.0;
+    auto sig = [&](double t) {
+        const double dt = t - lastT;
+        lastT = t;
+        const double busy = 0.4 * std::sin(2.0 * kPi * 430.0 * t) + 0.3 * std::sin(2.0 * kPi * 2900.0 * t) + 0.25 * std::sin(2.0 * kPi * 9700.0 * t);
+        p1 += 2.0 * kPi * (kOffset + 0.9 * 75000.0 * std::sin(2.0 * kPi * 1000.0 * t)) * dt;
+        p2 += 2.0 * kPi * (kOffset + 600e3 + 75000.0 * busy) * dt;
+        return phasor(p1, 0.002) + phasor(p2, 0.632);
+    };
+    auto a = runReceiver("WFM", 150e3, sig, 1.6, 0.6, false, 0.0f, {{"stereoMode", 0}});
+    const double s = sinadDb(a.left, 1000.0, kAudioRate);
+    check(s > 64.0, "a +50 dB station 600 kHz away does not leak in: SINAD " + std::to_string(s) + " dB");
+}
+
+void testIqCorrection() {
+    std::puts("IQ correction");
+    // A strong station at +300 kHz (nothing at -300 kHz), and equal stations at
+    // -800 / +800 kHz that must not be taken for images. I/Q gain 3 %, phase 2 deg.
+    const size_t n = size_t(1.5 * kInRate);
+    std::vector<Complex> x(n);
+    const double g = 1.03, ph = 2.0 * kPi / 180.0;
+    for (size_t i = 0; i < n; i++) {
+        const double t = double(i) / kInRate;
+        const Complex z = phasor(2.0 * kPi * 300e3 * t, 0.3) + phasor(2.0 * kPi * -800e3 * t + 1.0, 0.1) + phasor(2.0 * kPi * 800e3 * t, 0.1);
+        x[i] = Complex(z.real(), float(g * (z.imag() * std::cos(ph) + z.real() * std::sin(ph))));
+    }
+    auto level = [](const std::vector<Complex>& v, double hz) {
+        return db(complexToneAmplitude(std::vector<Complex>(v.end() - 65536, v.end()), hz, kInRate));
+    };
+    const double imageBefore = level(x, -300e3);
+
+    SharkSDR::dsp::IqBalancer bal;
+    SharkSDR::dsp::Fft fft(8192);
+    std::vector<Complex> spec(8192);
+    for (size_t p = 0; p + 24000 <= n; p += 24000) {
+        bal.process(x.data() + p, 24000);
+        for (size_t k = 0; k < 8192; k++)
+            spec[k] = x[p + 24000 - 8192 + k] * float(0.5 - 0.5 * std::cos(2.0 * kPi * double(k) / 8192.0));
+        fft.forward(spec.data());
+        bal.update(spec.data(), 8192);
+    }
+    const double station = level(x, 300e3), imageAfter = level(x, -300e3);
+    check(station - imageAfter > 70.0, "image of a strong station: " + std::to_string(station - imageBefore) + " -> " +
+                                           std::to_string(station - imageAfter) + " dB below it");
+    const double lo = level(x, -800e3), hi = level(x, 800e3);
+    check(std::fabs(lo - db(0.1)) < 0.5 && std::fabs(hi - db(0.1)) < 0.5,
+          "stations on both sides are kept (" + std::to_string(lo) + " / " + std::to_string(hi) + " dB)");
+}
+
+void testAudioNoiseReduction() {
+    std::puts("Audio noise reduction");
+    std::mt19937 rng(7);
+    std::normal_distribution<float> noise(0.0f, 0.03f);
+    // Noise only: pushed down by the configured amount.
+    SharkSDR::dsp::AudioNoiseReduction nr;
+    nr.configure(kAudioRate, 12.0f);
+    std::vector<Stereo> x(size_t(6 * kAudioRate));
+    for (auto& v : x) v = Stereo(noise(rng), noise(rng));
+    auto y = x;
+    nr.process(y.data(), y.size());
+    double pin = 0.0, pout = 0.0;
+    for (size_t i = size_t(3 * kAudioRate); i < x.size(); i++) {
+        pin += double(x[i].l) * x[i].l + double(x[i].r) * x[i].r;
+        pout += double(y[i].l) * y[i].l + double(y[i].r) * y[i].r;
+    }
+    const double reduction = 10.0 * std::log10(pout / pin);
+    check(reduction < -10.5 && reduction > -13.5, "noise is reduced by ~12 dB (" + std::to_string(reduction) + " dB)");
+
+    // A steady tone well above the noise is not mistaken for noise.
+    nr.configure(kAudioRate, 12.0f);
+    for (size_t i = 0; i < x.size(); i++) x[i] = Stereo(float(0.3 * std::sin(2.0 * kPi * 1000.0 * double(i) / kAudioRate)) + noise(rng));
+    nr.process(x.data(), x.size());
+    std::vector<float> tail;
+    for (size_t i = size_t(3 * kAudioRate); i < x.size(); i++) tail.push_back(x[i].l);
+    const double tone = toneAmplitude(tail, 1000.0, kAudioRate);
+    check(tone > 0.29 && tone < 0.31, "a steady tone keeps its level (" + std::to_string(tone) + " of 0.3)");
+}
+
+void testAtan2() {
+    std::puts("atan2");
+    double worst = 0.0;
+    for (int i = 0; i < 100000; i++) {
+        const double a = -kPi + 2.0 * kPi * (double(i) + 0.5) / 100000.0;
+        for (double r : {1e-6, 0.01, 1.0, 1000.0}) {
+            const float y = float(r * std::sin(a)), x = float(r * std::cos(a));
+            worst = std::max(worst, std::fabs(double(SharkSDR::dsp::accurateAtan2(y, x)) - std::atan2(double(y), double(x))));
+        }
+    }
+    char msg[64];
+    std::snprintf(msg, sizeof(msg), "accurateAtan2 max error %.1e rad", worst);
+    check(worst < 1e-6, msg);
+}
+
+void testAudioCutoffFollowsBandwidth() {
+    std::puts("Audio cut-off");
+    // NFM with a 10 kHz tone: cut off at 12.5 kHz bandwidth (6.25 kHz audio),
+    // heard after widening to 25 kHz while running.
+    auto demod = SharkSDR::dsp::createBuiltinDemodulator("NFM");
+    SharkSDR::dsp::Receiver rx;
+    rx.setInputRate(kInRate);
+    rx.setAudioRate(kAudioRate);
+    rx.setDemodulator(demod.get());
+    rx.setBandwidth(12500.0);
+    rx.setOffset(kOffset);
+    double phase = 0.0;
+    std::vector<Complex> block(24000);
+    std::vector<Stereo> audio;
+    std::vector<float> narrow, wide;
+    for (size_t pos = 0; pos < size_t(1.6 * kInRate); pos += block.size()) {
+        if (pos == size_t(0.8 * kInRate)) rx.setBandwidth(25000.0);
+        for (size_t i = 0; i < block.size(); i++) {
+            const double t = double(pos + i) / kInRate;
+            phase += 2.0 * kPi * (kOffset + 2000.0 * std::sin(2.0 * kPi * 10000.0 * t)) / kInRate;
+            block[i] = phasor(phase, 0.05);
+        }
+        audio.clear();
+        rx.process(block.data(), block.size(), audio);
+        for (const auto& f : audio) (pos < size_t(0.8 * kInRate) ? narrow : wide).push_back(f.l);
+    }
+    narrow.erase(narrow.begin(), narrow.begin() + 12000);
+    wide.erase(wide.begin(), wide.begin() + 12000);
+    const double before = toneAmplitude(narrow, 10000.0, kAudioRate), after = toneAmplitude(wide, 10000.0, kAudioRate);
+    check(db(before) < -40.0 && after > 0.1,
+          "10 kHz audio: " + std::to_string(db(before)) + " dB at 12.5 kHz bandwidth, " + std::to_string(db(after)) + " dB at 25 kHz");
+}
+
+void testStreamHooks() {
+    std::puts("Stream hooks");
+    auto wfm = SharkSDR::dsp::createBuiltinDemodulator("WFM");
+    auto nfm = SharkSDR::dsp::createBuiltinDemodulator("NFM");
+    SharkSDR::dsp::Receiver rx;
+    rx.setInputRate(kInRate);
+    rx.setAudioRate(kAudioRate);
+    rx.setDemodulator(wfm.get());
+    rx.setBandwidth(150e3);
+    rx.setOffset(kOffset);
+
+    struct Seen {
+        size_t calls = 0, samples = 0;
+        double rate = 0.0;
+        void note(size_t n, double r) { calls++, samples += n, rate = r; }
+    } channel, mpx, demodulated, audio;
+    bool muteMpx = false;
+    SharkSDR::dsp::Receiver::StreamHooks hooks;
+    hooks.channel = [&](Complex*, size_t n, double r) { channel.note(n, r); };
+    hooks.mpx = [&](float* s, size_t n, double r) {
+        mpx.note(n, r);
+        if (muteMpx) std::fill(s, s + n, 0.0f);
+    };
+    hooks.demodulated = [&](Stereo*, size_t n, double r) { demodulated.note(n, r); };
+    hooks.audio = [&](Stereo*, size_t n, double r) { audio.note(n, r); };
+    rx.setStreamHooks(hooks);
+
+    // A WFM station modulated with a 1 kHz tone; returns the left channel
+    // without its first 0.2 s.
+    size_t t = 0;
+    double phase = 0.0;
+    auto run = [&](double seconds) {
+        std::vector<Complex> block(24000);
+        std::vector<Stereo> buf;
+        std::vector<float> out;
+        for (size_t pos = 0; pos < size_t(seconds * kInRate); pos += block.size()) {
+            for (auto& v : block) {
+                phase += 2.0 * kPi * (kOffset + 37500.0 * std::sin(2.0 * kPi * 1000.0 * double(t++) / kInRate)) / kInRate;
+                v = phasor(phase, 0.1);
+            }
+            buf.clear();
+            rx.process(block.data(), block.size(), buf);
+            for (const auto& f : buf) out.push_back(f.l);
+        }
+        out.erase(out.begin(), out.begin() + std::min(out.size(), size_t(0.2 * kAudioRate)));
+        return out;
+    };
+
+    const double tone = toneAmplitude(run(1.0), 1000.0, kAudioRate);
+    char rates[160];
+    std::snprintf(rates, sizeof(rates), "channel %.0f, mpx %.0f, demodulated %.0f, audio %.0f samples/s", channel.rate, mpx.rate,
+                  demodulated.rate, audio.rate);
+    check(channel.rate == 250e3 && mpx.rate == 250e3 && demodulated.rate == 250e3 && audio.rate == kAudioRate &&
+              std::abs(double(channel.samples) - 250e3) < 2500.0 && mpx.samples == channel.samples &&
+              demodulated.samples == channel.samples && std::abs(double(audio.samples) - kAudioRate) < 480.0,
+          std::string("every hook sees the whole stream at its rate (") + rates + ")");
+
+    muteMpx = true;
+    const double muted = rms(run(0.5));
+    muteMpx = false;
+    check(tone > 0.2 && muted < 1e-4,
+          "the demodulator decodes the MPX as the hook left it (tone " + std::to_string(tone) + ", zeroed MPX " +
+              std::to_string(muted) + " rms)");
+
+    rx.setBypassDemodulation(true);
+    const size_t mpxBefore = mpx.calls, channelBefore = channel.calls, demodulatedBefore = demodulated.calls;
+    const double bypassed = rms(run(0.5));
+    check(bypassed < 1e-4 && mpx.calls == mpxBefore && channel.calls > channelBefore && demodulated.calls > demodulatedBefore,
+          "bypassing the demodulator: silent audio, channel IQ still delivered (" + std::to_string(bypassed) + " rms)");
+    rx.setBypassDemodulation(false);
+    check(toneAmplitude(run(0.6), 1000.0, kAudioRate) > 0.2, "the tone is back after the bypass");
+
+    rx.setDemodulator(nfm.get());
+    const size_t mpxCalls = mpx.calls;
+    run(0.3);
+    const size_t nfmCalls = mpx.calls - mpxCalls;
+    rx.setDemodulator(wfm.get());
+    run(0.3);
+    check(nfmCalls == 0 && mpx.calls > mpxCalls, "the MPX hook follows the demodulator (none from NFM, back with WFM)");
+}
+
 void testWav() {
     std::puts("WAV");
     const auto path = std::filesystem::temp_directory_path() / "sharksdr_test.wav";
@@ -350,6 +612,13 @@ int main() {
     testSquelch();
     testIfNoiseReduction();
     testAudioFilters();
+    testHalfBand();
+    testSelectivity();
+    testIqCorrection();
+    testAudioNoiseReduction();
+    testAtan2();
+    testAudioCutoffFollowsBandwidth();
+    testStreamHooks();
     testWav();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

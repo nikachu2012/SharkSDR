@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,6 +43,8 @@ struct AudioFilterSettings {
     float highpassHz = 300.0f;
     bool lowpass = false;
     float lowpassHz = 3000.0f;
+    bool noiseReduction = false;
+    float noiseReductionDb = 12.0f;
 };
 
 struct SpectrumSettings {
@@ -112,6 +115,11 @@ public:
     void setDcBlock(bool on) { dcBlock_ = on; }
     bool swapIq() const { return swapIq_.load(); }
     void setSwapIq(bool on) { swapIq_ = on; }
+    bool iqCorrection() const { return iqCorrection_.load(); }
+    void setIqCorrection(bool on) {
+        if (on && !iqCorrection_) iqBalancer_.reset();
+        iqCorrection_ = on;
+    }
 
     float signalLevel() const { return signalLevel_.load(); }
     bool squelchOpen() const { return squelchOpen_.load(); }
@@ -121,11 +129,18 @@ public:
     void setSpectrumSettings(const SpectrumSettings& s);
     void takeSpectrumFrames(std::vector<SpectrumFrame>& out);
 
-    // ---- taps (thread-safe) --------------------------------------------------
+    // ---- taps and stream hooks (thread-safe) ---------------------------------
     TapHandle addIqTap(IqTapCallback cb, OwnerId owner);
     TapHandle addAudioTap(AudioTapCallback cb, OwnerId owner);
-    void removeTap(TapHandle handle);
-    void removeTaps(OwnerId owner);
+    TapHandle addStreamHook(ProcessorType type, IqProcessor hook, OwnerId owner);
+    TapHandle addStreamHook(ProcessorType type, RealProcessor hook, OwnerId owner);
+    TapHandle addStreamHook(ProcessorType type, AudioProcessor hook, OwnerId owner);
+    void removeTap(TapHandle handle);  // taps and hooks
+    void removeTaps(OwnerId owner);    // taps, hooks and the owner's demodulator bypass
+
+    // The demodulator is bypassed while at least one owner asks for it.
+    void setBypassDemodulation(OwnerId owner, bool bypass);
+    bool bypassDemodulation() const;
 
     // ---- statistics ----------------------------------------------------------
     float dspLoad() const { return dspLoad_.load(); }
@@ -160,15 +175,27 @@ private:
         OwnerId owner;
         AudioTapCallback cb;
     };
+    struct StreamHook {
+        TapHandle handle = 0;
+        OwnerId owner = kCoreOwner;
+        ProcessorType type = ProcessorType::RawIQ;
+        IqProcessor iq;  // exactly one of these is set, matching `type`
+        RealProcessor real;
+        AudioProcessor audio;
+    };
 
     void dspLoop();
     void processBlock(Complex* data, size_t count);
     void processSpectrum(const Complex* data, size_t count, double rate, double center);
-    void computeSpectrumFrame(double rate, double center);
+    void spectrumLoop();
+    void computeSpectrumFrame();
     void retune(double centerHz);
     void clampVfo();
     ModeEntry* findMode(const std::string& name);
     void applyMode(ModeEntry& entry);
+    TapHandle addStreamHook(StreamHook hook, OwnerId owner);
+    template <typename T>
+    void runStreamHooks(ProcessorType type, T* data, size_t count, double sampleRate, double frequency);
 
     AudioOutput& audio_;
 
@@ -199,12 +226,14 @@ private:
     AudioFilterSettings audioFiltersFor(const std::string& mode) const;
     nlohmann::json modeStates_ = nlohmann::json::object();
     dsp::Receiver receiver_;
+    std::set<OwnerId> bypassOwners_;
     bool squelchEnabled_ = false;
     float squelchLevel_ = -50.0f;
     std::atomic<float> volume_{0.7f};
     std::atomic<bool> muted_{false};
     std::atomic<bool> dcBlock_{true};
     std::atomic<bool> swapIq_{false};
+    std::atomic<bool> iqCorrection_{true};
     std::atomic<float> signalLevel_{-150.0f};
     std::atomic<bool> squelchOpen_{true};
 
@@ -219,30 +248,45 @@ private:
     std::vector<Stereo> audioBuf_;
     dsp::DcBlocker dcBlocker_;
     double dcRate_ = 0.0;
+    dsp::IqBalancer iqBalancer_;
     std::atomic<float> dspLoad_{0.0f};
     std::atomic<uint64_t> dropped_{0};
 
-    // spectrum (DSP thread state)
+    // spectrum: the DSP thread collects the samples, a worker thread runs the
+    // FFT. Frames are skipped while the worker is busy, so a large FFT at a
+    // high frame rate can never hold up the audio.
     mutable std::mutex spectrumMutex_;
     SpectrumSettings spectrumSettings_;
     uint64_t spectrumVersion_ = 1;
     uint64_t appliedSpectrumVersion_ = 0;
     std::deque<SpectrumFrame> spectrumFrames_;
-    SpectrumSettings fftCfg_;
-    dsp::Fft fft_;
-    std::vector<float> fftWindow_;
-    float fftWindowSum_ = 1.0f;
+    SpectrumSettings fftCfg_;  // DSP thread
     std::vector<Complex> fftRing_;
     size_t fftRingPos_ = 0;
     size_t fftFilled_ = 0;
     double fftAcc_ = 0.0;
-    std::vector<Complex> fftBuf_;
 
-    // taps
+    std::thread spectrumThread_;
+    std::mutex jobMutex_;
+    std::condition_variable jobCv_;
+    bool jobReady_ = false;                  // guarded by jobMutex_
+    std::atomic<bool> spectrumBusy_{false};  // the worker owns the job below
+    std::vector<Complex> jobSamples_;        // oldest first
+    double jobRate_ = 0.0, jobCenter_ = 0.0;
+    dsp::WindowType jobWindow_ = dsp::WindowType::BlackmanHarris;
+    // worker thread only
+    dsp::Fft fft_;
+    std::vector<float> fftWindow_;
+    dsp::WindowType fftWindowType_ = dsp::WindowType::BlackmanHarris;
+    float fftWindowSum_ = 1.0f;
+
+    // taps and stream hooks
     std::mutex tapsMutex_;
     std::vector<IqTap> iqTaps_;
     std::vector<AudioTap> audioTaps_;
+    std::vector<StreamHook> streamHooks_;  // in registration order
     TapHandle nextTap_ = 1;
+    double blockVfo_ = 0.0;  // DSP thread: VFO frequency of the block being processed
 };
 
 }  // namespace SharkSDR

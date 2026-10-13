@@ -24,6 +24,7 @@ namespace {
 
 std::mutex g_overrideMutex;
 fs::path g_configOverride;
+fs::path g_dataOverride;
 
 fs::path envPath(const char* name) {
 #if defined(_WIN32)
@@ -125,7 +126,16 @@ fs::path homeDirectory() {
     return p.empty() ? fs::current_path() : p;
 }
 
+void setUserDataDirectoryOverride(const fs::path& path) {
+    std::lock_guard<std::mutex> lock(g_overrideMutex);
+    g_dataOverride = path;
+}
+
 fs::path userDataDirectory() {
+    {
+        std::lock_guard<std::mutex> lock(g_overrideMutex);
+        if (!g_dataOverride.empty()) return g_dataOverride;
+    }
     std::error_code ec;
     fs::path docs = homeDirectory() / "Documents";
     return appFolder(fs::is_directory(docs, ec) ? docs : homeDirectory());

@@ -1,0 +1,30 @@
+# Plugin SDK of a SharkSDR @PROJECT_VERSION@ build folder. A plugin kept in its own project is built against it,
+# without rebuilding SharkSDR, and the result is a file to put into that build's bin/plugins/ folder:
+#
+#   find_package(SharkSDR CONFIG REQUIRED PATHS <SharkSDR build folder> NO_DEFAULT_PATH)
+#   sharksdr_add_plugin(my_plugin SOURCES my_plugin.cpp)
+#
+# Plugins share C++ objects with the application: build them with the same compiler and configuration.
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/SharkSDRTargets.cmake")
+
+# sharksdr_add_plugin() links "SharkSDR_core", as inside SharkSDR's own build
+if(NOT TARGET SharkSDR_core)
+    add_library(SharkSDR_core INTERFACE IMPORTED)
+    target_link_libraries(SharkSDR_core INTERFACE SharkSDR::SharkSDR_core)
+endif()
+
+# The plugins folder of that SharkSDR build, and where plugins built here go
+set(SharkSDR_PLUGIN_DIR "@SHARKSDR_PLUGIN_OUTPUT_DIR@")
+if(NOT SHARKSDR_PLUGIN_OUTPUT_DIR)
+    set(SHARKSDR_PLUGIN_OUTPUT_DIR "${CMAKE_BINARY_DIR}/plugins")
+endif()
+set(SharkSDR_BUILD_TYPE "@CMAKE_BUILD_TYPE@")
+if(SharkSDR_BUILD_TYPE AND CMAKE_BUILD_TYPE AND NOT SharkSDR_BUILD_TYPE STREQUAL CMAKE_BUILD_TYPE)
+    message(WARNING "SharkSDR was built as ${SharkSDR_BUILD_TYPE}, this project as ${CMAKE_BUILD_TYPE}: "
+                    "with MSVC the plugin will not load (Debug and Release runtimes differ)")
+endif()
+
+include("@PROJECT_SOURCE_DIR@/cmake/SharkSDRHelpers.cmake")

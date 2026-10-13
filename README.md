@@ -14,11 +14,11 @@ and sources, demodulation modes, panels and tools can all be added later as **pl
 
 | Area | Features |
 |---|---|
-| Display | FFT spectrum (smoothing, peak hold, fill), waterfall (Turbo / Classic / Viridis / Inferno / Grayscale), zoom and pan, dB range control, auto range |
+| Display | FFT spectrum (smoothing, peak hold, fill), waterfall (Turbo / Classic / Viridis / Inferno / Grayscale), zoom and pan, dB range control, auto range. The FFT runs on its own thread, so large FFT sizes never interrupt the audio |
 | Tuning | Frequency dial (change each digit with the wheel or a click), click/drag tuning on the spectrum, wheel step tuning, drag the band edges to change the bandwidth, center tuning, direct entry (`145.5M` etc.) |
 | Demodulation | WFM (stereo decoder with automatic stereo/mono blend based on signal quality, 50/75 µs de-emphasis), NFM, AM, USB, LSB, DSB, CW (adjustable BFO), RAW, plus SAM (synchronous AM) as a plugin |
-| Receive chain | NCO → cascaded half-band decimation by 2 → polyphase resampler → channel filter → squelch → demodulator → audio LPF/resampling, AGC, DC removal, I/Q swap |
-| Noise reduction | IF noise reduction for FM (carrier-tracking, +7 to 9 dB SINAD on weak stations), per-mode high-pass/low-pass filters (8th-order Butterworth, for removing CTCSS tones or reducing FM hiss) |
+| Receive chain | NCO → cascaded half-band decimation by 2 (100 dB stop band) → polyphase resampler (90 dB) → channel filter (90 dB) → squelch → demodulator → audio half-band decimation and low-pass/resampling (80 dB); SIMD (SSE2 / NEON) filters, AGC, DC removal, automatic I/Q imbalance correction, I/Q swap |
+| Noise reduction | WFM discriminator at twice the channel rate (+4 to 6 dB SINAD near the FM threshold), IF noise reduction for FM (carrier-tracking, another +3 to 10 dB on weak stations), audio noise reduction for every mode (spectral MMSE-LSA with a minimum-statistics noise estimate), per-mode high-pass/low-pass filters (8th-order Butterworth, for removing CTCSS tones or reducing FM hiss) |
 | Audio | Output through miniaudio (WASAPI / CoreAudio / ALSA / PulseAudio, etc.), device selection, volume and mute |
 | Sources (plugins) | Signal generator (a virtual band for demos), IQ file playback (WAV / cu8 / cs8 / cs16 / cf32), rtl_tcp, SoapySDR\*, native RTL-SDR\* |
 | Tools (plugins) | Recorder (audio or baseband IQ to WAV), bookmarks (markers on the spectrum), Hello Example as a template |
@@ -79,7 +79,7 @@ build/bin/
 
 ### Tests
 
-Headless tests check the DSP chain (the output tone of every demodulation mode, WFM stereo separation, SSB opposite-sideband rejection, squelch, WAV reading and writing, and more).
+Headless tests check the DSP chain (the output tone of every demodulation mode, WFM stereo separation and weak-signal SINAD, SSB opposite-sideband rejection, rejection of a +50 dB station 600 kHz away, I/Q image removal, audio noise reduction, squelch, stream hooks, WAV reading and writing, and more).
 
 ```sh
 ctest --preset release
@@ -88,8 +88,9 @@ ctest --preset release
 There are also self-tests for developers that drive the GUI (they inject input into ImGui instead of using the real mouse):
 
 ```sh
-# Checks click tuning, wheel tuning, Ctrl+wheel zoom, band edge dragging, right-drag panning
-# and typing values into sliders (Enter applies / Esc cancels, vertical sliders too),
+# Checks click tuning, wheel tuning, Ctrl+wheel zoom, band edge dragging, right-drag panning,
+# typing values into sliders (Enter applies / Esc cancels, vertical sliders too) and stream hooks
+# at every point (replacing the audio in MonitorAF, bypassing the demodulator, removal),
 # and records for about 1 second with Ctrl+R meanwhile (exit code 2 on failure)
 SharkSDR --config <temporary folder> --autostart --test-ui --screenshot ui.png --frames 220
 # Unloads and reloads every plugin while receiving
@@ -116,6 +117,9 @@ so you can try it right away without hardware: press the ▶ button (or Space). 
 
 On macOS, use Cmd instead of Ctrl.
 
+For weak or noisy stations, turn on **Audio NR** in the Radio panel (it learns the background hiss in about a second; the slider sets how far it is pushed down), and for FM also **IF NR** and a **Low pass** of 8 to 10 kHz.
+**IQ correction** in the Source panel (on by default) removes the mirror images that zero-IF tuners such as the E4000 and FC0012/FC0013 produce: a strong station at +f appearing at -f.
+
 ### Hardware
 
 - **rtl_tcp** (all platforms, no driver to link): run `rtl_tcp -a 0.0.0.0` on the computer with the RTL-SDR, then choose "RTL-TCP" as the source and enter the host name.
@@ -140,7 +144,9 @@ Put a file named `portable` next to the executable to switch to portable mode, w
 
 ## Extending with plugins
 
-The extension points are sources, demodulation modes, sidebar panels, the Tools menu, custom windows, overlays on the spectrum, and IQ/audio taps.
+The extension points are sources, demodulation modes, sidebar panels, the Tools menu, custom windows, overlays on the spectrum, IQ/audio taps,
+and stream hooks that work like SDR#'s (RawIQ, DecimatedAndFilteredIQ, FMMPX, DemodulatorOutput, FilteredAudioOutput, MonitorAF):
+a decoder for a digital voice mode reads the signal from them and plays its voice by replacing the audio in MonitorAF, under the volume and mute controls.
 This is all a minimal plugin needs:
 
 ```cpp
@@ -163,7 +169,8 @@ SHARKSDR_PLUGIN(MyPlugin, "My plugin", "0.1.0", "Me", "Example")
 sharksdr_add_plugin(my_plugin SOURCES my_plugin.cpp)
 ```
 
-Plugins kept outside the repository can be built along with it using `-DSHARKSDR_EXTRA_PLUGINS=/path/to/my_plugin`.
+Plugins kept outside the repository can be built along with it using `-DSHARKSDR_EXTRA_PLUGINS=/path/to/my_plugin`,
+or on their own against a SharkSDR build folder (it doubles as a plugin SDK, `find_package(SharkSDR)`), which gives a file to drop into `bin/plugins/`.
 See **[docs/PLUGIN_GUIDE.md](docs/PLUGIN_GUIDE.md)** for details. The bundled plugins (`plugins/`) also work as samples.
 
 ## Source layout
@@ -182,7 +189,7 @@ Threads: UI thread (ImGui) / source streaming thread → lock-free ring buffer �
 
 ## Testing status
 
-- Windows 11 + MSVC 19.44 (VS 2022): Release and Debug builds (no warnings, no ImGui asserts in Debug), all DSP tests and the UI self-tests pass. Reception with the signal generator, IQ file playback and rtl_tcp (against a simulated server), unloading and reloading plugins while running, and saving and restoring settings have been checked. The SoapySDR / RTL-SDR plugins have been built and loaded against the libraries, but not tested with real devices. Audio output has been checked through the buffer state, not by ear.
+- Windows 11 + MSVC 19.44 (VS 2022): Release and Debug builds (no warnings, no ImGui asserts in Debug), all DSP tests and the UI self-tests pass. The WFM chain (2.4 MS/s in, 150 kHz channel) uses about 9 % of one core. Reception with the signal generator, IQ file playback and rtl_tcp (against a simulated server), unloading and reloading plugins while running, and saving and restoring settings have been checked. The SoapySDR / RTL-SDR plugins have been built and loaded against the libraries, but not tested with real devices. Audio output has been checked through the buffer state, not by ear.
 - Linux / macOS: written with portability in mind. CI (`.github/workflows/build.yml`) builds and runs the DSP tests on Windows, Linux and macOS; the GUI itself has not been tried on Linux or macOS yet.
 
 ## Third-party

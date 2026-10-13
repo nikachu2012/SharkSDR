@@ -35,7 +35,7 @@ The `SHARKSDR_PLUGIN` macro defines the C entry points the application looks for
 
 ## 2. Building
 
-Either way, the output goes to `build/bin/plugins/`.
+Built along with SharkSDR (the first two ways), the output goes to `build/bin/plugins/`.
 
 **Inside the repository**: copy `plugins/hello_example`, rename the folder and the target, and add it to `SHARKSDR_BUNDLED_PLUGINS` in `plugins/CMakeLists.txt`.
 
@@ -45,6 +45,26 @@ Either way, the output goes to `build/bin/plugins/`.
 cmake --preset release -DSHARKSDR_EXTRA_PLUGINS="/path/to/my_plugin;/path/to/another"
 cmake --build --preset release
 ```
+
+**On its own, as a file to drop in**: every SharkSDR build folder is also a plugin SDK (`SharkSDRConfig.cmake`).
+A plugin project builds against it without rebuilding SharkSDR, and the resulting file only has to be copied into that build's `bin/plugins/`.
+Write the plugin's `CMakeLists.txt` so that it works both ways:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+if(NOT COMMAND sharksdr_add_plugin)  # not inside SharkSDR's build
+    project(my_plugin LANGUAGES CXX)
+    find_package(SharkSDR CONFIG REQUIRED PATHS "${SHARKSDR_BUILD_DIR}" NO_DEFAULT_PATH)
+endif()
+sharksdr_add_plugin(my_plugin SOURCES my_plugin.cpp)
+```
+
+```sh
+cmake -S my_plugin -B my_plugin/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHARKSDR_BUILD_DIR=/path/to/SharkSDR/build
+cmake --build my_plugin/build      # -> my_plugin/build/plugins/my_plugin.(dll|so|dylib)
+```
+
+Use the same compiler and configuration (Release / Debug) as the SharkSDR build. When SharkSDR's plugin API changes, build the plugin again: the plugin manager tells why an old one does not load.
 
 A finished plugin file is loaded from the `plugins/` folder next to the executable, the `plugins/` folder in the user settings folder, or a folder given with `--plugins DIR`.
 
@@ -66,8 +86,10 @@ Everything you register is **removed automatically when the plugin is unloaded**
 | `registerFrameCallback(fn)` | Called every frame (for your own windows) | `hello_example` |
 | `registerSpectrumOverlay(draw)` | Drawing and click handling on the spectrum | `bookmarks` |
 | `addIqTap(cb)` / `addAudioTap(cb)` | Access to IQ and demodulated audio (called on the DSP thread) | `recorder` |
+| `registerStreamHook(type, hook)` | Read or change the signal at a point of the receive chain, like SDR#'s stream hooks (see 6) | `hello_example` |
+| `setBypassDemodulation(bool)` | Leave the built-in demodulator out (SDR#'s BypassDemodulation) | |
 
-The Host also controls the receiver (`start/stop`, `frequency/setFrequency`, `mode/setMode`, `bandwidth/setBandwidth`, `signalLevel`, `sampleRate`, `centerFrequency`, etc.),
+The Host also controls the receiver (`start/stop`, `frequency/setFrequency`, `centerFrequency/setCenterFrequency`, `mode/setMode`, `bandwidth/setBandwidth`, `signalLevel`, `sampleRate`, `sourceTunable`, etc.),
 and provides per-plugin settings with `config()` (JSON, saved automatically on exit), `log()` and `dataDirectory()`.
 
 ## 4. Writing a source
@@ -134,23 +156,83 @@ host.registerDemodulator("MYMODE", [] { return std::make_unique<MyDemod>(); });
 Mode-specific settings go in `drawSettings()` (shown in the Radio panel) and are saved with `loadState()` / `saveState()`.
 The DSP thread is paused during these calls, so no locking is needed.
 
-## 6. Threading rules
+## 6. Writing a decoder: stream hooks (as in SDR#)
+
+A decoder for a digital mode needs the signal from some point of the receive chain, and a voice decoder also plays its own audio.
+SharkSDR handles this the same way as SDR#: register a *stream hook* at one of the points below ([`host.h`](../core/include/SharkSDR/host.h), `ProcessorType`, with SDR#'s names).
+A hook gets every block in place and may change it; the rest of the chain continues with what it leaves in the buffer.
+
+| `ProcessorType` | Data | Rate | What it carries |
+|---|---|---|---|
+| `RawIQ` | `Complex` | source rate | The whole tuner span (after Swap I/Q, DC removal and IQ correction). `info.frequency` is the tuner center |
+| `DecimatedAndFilteredIQ` | `Complex` | channel rate | The VFO channel after the channel filter, with the VFO at 0 Hz. `info.frequency` is the VFO |
+| `FMMPX` | `float` | 250 kHz | WFM only: the discriminator output, before stereo decoding and de-emphasis |
+| `DemodulatorOutput` | `Stereo` | channel rate | The demodulated audio (silent while the squelch is closed) |
+| `FilteredAudioOutput` | `Stereo` | audio rate | After the audio low-pass, noise reduction and the high/low-pass filters |
+| `MonitorAF` | `Stereo` | audio rate | The audio being played, before mute and volume |
+
+The channel rate is the demodulator's `channelRate()` (WFM 250 kHz, NFM 50 kHz, AM/SSB 24 kHz); take the rate of every block from `info.sampleRate`.
+Hooks at the same point run in the order they were registered. Registering a hook whose sample type does not match the point returns 0.
+
+A voice decoder that cuts its channel out of the wideband IQ itself (so the Radio panel's bandwidth does not matter), and plays its voice instead of the radio while it has some:
+
+```cpp
+void init(SharkSDR::Host& host) override {
+    host_ = &host;
+    host.registerFrameCallback([this] { vfo_ = host_->frequency(); });  // the VFO, for the DSP thread
+
+    // Signal in: the whole tuner span and its center frequency.
+    host.registerStreamHook(SharkSDR::ProcessorType::RawIQ,
+                            [this](SharkSDR::Complex* iq, size_t n, const SharkSDR::StreamInfo& info) {
+                                decoder_.push(iq, n, info.sampleRate, vfo_ - info.frequency);
+                            });
+    // Voice out: replaces what is played while there is voice. Mute and volume still apply.
+    host.registerStreamHook(SharkSDR::ProcessorType::MonitorAF,
+                            [this](SharkSDR::Stereo* audio, size_t n, const SharkSDR::StreamInfo& info) {
+                                if (decoder_.playing()) decoder_.readVoice(audio, n, info.sampleRate);
+                            });
+}
+```
+
+(`decoder_` stands for your decoder; `vfo_` is a `std::atomic<double>`.) To mix the voice into the radio's audio instead, add to `audio[i]` rather than overwriting it.
+A decoder that makes all the audio itself can call `setBypassDemodulation(true)`: the demodulator is then left out, and the audio points carry silence for it to fill.
+Hooks are removed, and the bypass released, automatically when the plugin is unloaded.
+
+Coming from an SDR# plugin:
+
+| SDR# | SharkSDR |
+|---|---|
+| `control.RegisterStreamHook(hook, ProcessorType.RawIQ)` | `host.registerStreamHook(ProcessorType::RawIQ, hook)` (returns a handle) |
+| `control.UnregisterStreamHook(hook)` | `host.unregisterStreamHook(handle)` |
+| `IIQProcessor.Process(Complex*, int length)` | `IqProcessor`: `(Complex*, size_t count, const StreamInfo&)` |
+| `IRealProcessor.Process(float*, int length)` for FMMPX | `RealProcessor`: `(float*, size_t count, const StreamInfo&)` |
+| `IRealProcessor.Process(float*, int length)` for audio (interleaved stereo, `length` floats) | `AudioProcessor`: `(Stereo*, size_t count, const StreamInfo&)` (`count` frames); `DemodulatorOutput` is stereo too |
+| The `SampleRate` property | `info.sampleRate`, with every block |
+| `Enabled` | Register and unregister the hook |
+| `control.Frequency` / `control.CenterFrequency` | `host.frequency()` (UI thread) / `info.frequency` of the same block |
+| Setting `control.Frequency` / `control.CenterFrequency` | `host.setFrequency()` / `host.setCenterFrequency()` (UI thread; a worker thread hands the call to a frame callback) |
+| `control.SourceIsTunable` | `host.sourceTunable()` |
+| `control.BypassDemodulation` | `host.setBypassDemodulation()` |
+
+## 7. Threading rules
 
 | Called on | What |
 |---|---|
 | UI thread | `init` / `shutdown`, panels, menus, frame callbacks, overlays, `Source::start/stop/tune/drawSettings`, almost every Host method |
-| DSP thread | IQ and audio taps, `Demodulator::process` |
+| DSP thread | IQ and audio taps, stream hooks, `Demodulator::process` |
 | The source's own thread | `SampleSink::pushSamples` / `sourceStopped` |
 
-Keep tap callbacks short and never block in them (move disk writes and the like to another thread; see `plugins/recorder`).
-Once `removeTap()` returns, the callback is guaranteed not to be called again.
+Keep tap and hook callbacks short and never block in them (move disk writes and the like to another thread; see `plugins/recorder`), and do not register or remove hooks from inside one.
+Once `removeTap()` / `unregisterStreamHook()` returns, the callback is guaranteed not to be called again.
 
-## 7. Building blocks you can use
+## 8. Building blocks you can use
 
 Plugins can use these parts of `SharkSDR_core` directly.
 
-- **DSP** (`SharkSDR/dsp/*.h`): `Fft`, window functions, `designLowpass` / `designComplexBandpass` (Kaiser-window FIR design), `FirFilter`, `ComplexFirFilter`, `FirDecimator`, `PowerDecimator`,
-  `Resampler<T>` (polyphase resampler with any ratio), `Nco`, `Agc`, `RingBuffer`, `OnePole`, `DcBlocker`,
+- **DSP** (`SharkSDR/dsp/*.h`): `Fft`, window functions, `designLowpass` / `designComplexBandpass` (Kaiser-window FIR design), `FirFilter`, `ComplexFirFilter`, `FirDecimator`,
+  `HalfBandDecimator` / `HalfBandInterpolator` / `DecimatorCascade` (`PowerDecimator`), `Resampler<T>` (polyphase resampler with any ratio),
+  the SIMD dot products behind all of them (`dotProduct`, `pairDotProduct`), `Nco`, `Agc`, `RingBuffer`, `OnePole`, `DcBlocker`, `IqBalancer`, `accurateAtan2`,
+  noise reduction (`FmIfNoiseReduction`, `AudioNoiseReduction`, `ButterworthFilter`),
   `Receiver` (the whole receive chain from frequency shift to audio; combine it with an IQ tap to make **an additional VFO**),
   and creating built-in demodulators with `createBuiltinDemodulator("NFM")` and the like
 - **UI** (`SharkSDR/ui/*.h`): `FrequencyDial`, `InputFrequency`, `PathPicker` (file/folder picker dialog), `LevelMeter`, `ToggleButton`, `HelpMarker`,
@@ -173,11 +255,11 @@ ImGui::Checkbox("Offset", &offset);
 
 - **Utilities**: `WavWriter` / `WavReader` (`SharkSDR/util/wav.h`), `TcpSocket` (`SharkSDR/util/net.h`), path functions (`SharkSDR/paths.h`), logging (`SharkSDR/log.h`)
 
-## 8. Bundled plugins (as samples)
+## 9. Bundled plugins (as samples)
 
 | Folder | What it is | Worth a look for |
 |---|---|---|
-| `hello_example` | Panel, menu, custom window, audio tap | A template |
+| `hello_example` | Panel, menu, custom window, stream hook | A template |
 | `signal_generator` | Signal generator source with a virtual band | Implementing `Source`, modulation on the transmit side |
 | `file_source` | IQ file playback | Non-tunable source, `sourceStopped`, `PathPicker` |
 | `rtl_tcp_source` | rtl_tcp client | `TcpSocket`, changing settings while running |

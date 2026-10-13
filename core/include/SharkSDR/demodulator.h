@@ -66,6 +66,20 @@ public:
     // Persistence of the mode specific settings.
     virtual void loadState(const nlohmann::json& state) {}
     virtual void saveState(nlohmann::json& state) const {}
+
+    // Set by the receiver. An FM broadcast demodulator passes its composite
+    // (MPX) signal through processMpx() before decoding it, so that the
+    // FMMPX stream hooks can read or change it (see Host::registerStreamHook()).
+    using MpxHook = std::function<void(float* samples, size_t count, double sampleRate)>;
+    void setMpxHook(MpxHook hook) { mpxHook_ = std::move(hook); }
+
+protected:
+    void processMpx(float* samples, size_t count, double sampleRate) {
+        if (mpxHook_) mpxHook_(samples, count, sampleRate);
+    }
+
+private:
+    MpxHook mpxHook_;
 };
 
 using DemodulatorFactory = std::function<std::unique_ptr<Demodulator>()>;

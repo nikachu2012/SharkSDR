@@ -38,6 +38,13 @@ include(Dependencies)
 add_subdirectory(core)
 add_subdirectory(app)
 
+# Plugin SDK of this build folder: plugins kept in their own projects build against it with
+# find_package(SharkSDR CONFIG PATHS <this folder>) and are dropped into bin/plugins/ (see docs/PLUGIN_GUIDE.md).
+export(TARGETS SharkSDR_core nlohmann_json NAMESPACE SharkSDR:: FILE "${CMAKE_BINARY_DIR}/SharkSDRTargets.cmake")
+configure_file(cmake/SharkSDRConfig.cmake.in "${CMAKE_BINARY_DIR}/SharkSDRConfig.cmake" @ONLY)
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file("${CMAKE_BINARY_DIR}/SharkSDRConfigVersion.cmake" COMPATIBILITY SameMinorVersion)
+
 if(SHARKSDR_BUILD_PLUGINS)
     add_subdirectory(plugins)
 endif()

@@ -28,5 +28,7 @@ SHARKSDR_API std::filesystem::path utf8ToPath(const std::string& utf8);
 
 // Overrides configDirectory() (command line --config).
 SHARKSDR_API void setConfigDirectoryOverride(const std::filesystem::path& path);
+// Overrides userDataDirectory() (the self-tests keep their recordings out of ~/Documents).
+SHARKSDR_API void setUserDataDirectoryOverride(const std::filesystem::path& path);
 
 }  // namespace SharkSDR

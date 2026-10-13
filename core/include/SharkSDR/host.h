@@ -25,6 +25,44 @@ using IqTapCallback = std::function<void(const Complex* samples, size_t count,
 // Called on the DSP thread with every block of demodulated audio (after volume).
 using AudioTapCallback = std::function<void(const Stereo* frames, size_t count, double sampleRate)>;
 
+// Points of the receive chain where stream hooks run, in processing order.
+// They are the stream hooks of SDR# (ProcessorType, with the same names), so
+// a decoder written for SDR# maps onto them one to one:
+//
+//   RawIQ                   Complex  source rate   the whole tuner span (after Swap I/Q, DC removal, IQ correction)
+//   DecimatedAndFilteredIQ  Complex  channel rate  the VFO channel after the channel filter, the VFO at 0 Hz
+//   FMMPX                   float    250 kHz       WFM only: discriminator output, before stereo decoding and de-emphasis
+//   DemodulatorOutput       Stereo   channel rate  demodulated audio (silent while the squelch is closed)
+//   FilteredAudioOutput     Stereo   audio rate    after the audio low-pass, noise reduction and high/low-pass filters
+//   MonitorAF               Stereo   audio rate    the audio being played, before mute and volume
+//
+// A hook may change the samples in place: the rest of the chain continues
+// with what it leaves in the buffer. A digital voice decoder typically reads
+// RawIQ or DecimatedAndFilteredIQ and writes its voice into MonitorAF,
+// replacing or mixing the radio's audio, so that the volume and mute
+// controls apply to it like to any other audio.
+enum class ProcessorType {
+    RawIQ,
+    DecimatedAndFilteredIQ,
+    FMMPX,
+    DemodulatorOutput,
+    FilteredAudioOutput,
+    MonitorAF,
+};
+
+// Passed to stream hooks along with every block.
+struct StreamInfo {
+    ProcessorType type = ProcessorType::RawIQ;
+    double sampleRate = 0.0;
+    // IQ streams: the RF frequency at 0 Hz (the tuner center for RawIQ, the
+    // VFO for DecimatedAndFilteredIQ). 0 for the other streams.
+    double frequency = 0.0;
+};
+
+using IqProcessor = std::function<void(Complex* samples, size_t count, const StreamInfo& info)>;
+using RealProcessor = std::function<void(float* samples, size_t count, const StreamInfo& info)>;
+using AudioProcessor = std::function<void(Stereo* frames, size_t count, const StreamInfo& info)>;
+
 // Passed to spectrum overlays to draw markers on top of the FFT plot.
 struct SpectrumOverlayContext {
     ImDrawList* drawList = nullptr;
@@ -81,6 +119,26 @@ public:
     virtual TapHandle addAudioTap(AudioTapCallback callback) = 0;
     virtual void removeTap(TapHandle handle) = 0;
 
+    // Stream hooks, as SDR#'s RegisterStreamHook() (see ProcessorType). The
+    // hook's sample type must match the point: IqProcessor for the IQ points,
+    // RealProcessor for FMMPX, AudioProcessor for the audio points; otherwise
+    // nothing is registered and 0 is returned. Hooks at the same point run in
+    // the order they were registered. They run on the DSP thread: keep them
+    // short, never block, and do not register or remove hooks from inside
+    // one. Thread-safe.
+    virtual TapHandle registerStreamHook(ProcessorType type, IqProcessor hook) = 0;
+    virtual TapHandle registerStreamHook(ProcessorType type, RealProcessor hook) = 0;
+    virtual TapHandle registerStreamHook(ProcessorType type, AudioProcessor hook) = 0;
+    // Once this returns, the hook is not called again.
+    void unregisterStreamHook(TapHandle handle) { removeTap(handle); }
+
+    // Leaves the built-in demodulator out (SDR#'s BypassDemodulation): the
+    // audio points then carry silence, for decoders that write all the audio
+    // into MonitorAF themselves. Released automatically when the plugin is
+    // unloaded.
+    virtual void setBypassDemodulation(bool bypass) = 0;
+    virtual bool bypassDemodulation() const = 0;  // set by any plugin
+
     // ---- Receiver control -------------------------------------------------
 
     virtual bool isRunning() const = 0;
@@ -88,8 +146,11 @@ public:
     virtual void stop() = 0;
 
     virtual std::string sourceName() const = 0;
+    virtual bool sourceTunable() const = 0;       // false for e.g. file playback
     virtual double sampleRate() const = 0;        // current IQ rate
     virtual double centerFrequency() const = 0;   // frequency of the IQ stream center
+    // Retunes the source (SDR#'s CenterFrequency); the VFO is kept inside the band.
+    virtual void setCenterFrequency(double hz) = 0;
 
     virtual double frequency() const = 0;         // VFO (listening) frequency
     virtual void setFrequency(double hz) = 0;

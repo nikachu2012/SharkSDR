@@ -20,7 +20,7 @@ public:
     // cutoffHz: -6 dB point of the low-pass (should be below min(in,out)/2)
     // transitionHz: transition band width
     void configure(double inRate, double outRate, double cutoffHz, double transitionHz,
-                   double attenuationDb = 70.0, int phases = 64) {
+                   double attenuationDb = 80.0, int phases = 128) {
         inRate_ = inRate;
         outRate_ = outRate;
         step_ = inRate / outRate;
@@ -38,21 +38,22 @@ public:
                                                  attenuationDb, protoLen, double(phases));
 
         // bank_[p][j] = proto[(k-1-j)*phases + p]  -> history is oldest first.
-        bank_.assign(size_t(phases + 1) * k, 0.0f);
+        // Complex / Stereo samples use the taps written twice (pair kernels).
+        const size_t copies = detail::kIsPair<T> ? 2 : 1;
+        bank_.assign(size_t(phases + 1) * k * copies, 0.0f);
         for (int p = 0; p <= phases; p++) {
             for (size_t j = 0; j < k; j++) {
-                size_t idx = j * size_t(phases) + size_t(p);
-                bank_[size_t(p) * k + (k - 1 - j)] = idx < protoLen ? proto[idx] : 0.0f;
+                const size_t idx = j * size_t(phases) + size_t(p);
+                const float v = idx < protoLen ? proto[idx] : 0.0f;
+                float* dst = &bank_[(size_t(p) * k + (k - 1 - j)) * copies];
+                for (size_t c = 0; c < copies; c++) dst[c] = v;
             }
         }
-        history_.assign(2 * k, T{});
-        pos_ = 0;
-        frac_ = 0.0;
+        reset();
     }
 
     void reset() {
-        std::fill(history_.begin(), history_.end(), T{});
-        pos_ = 0;
+        buffer_.assign(taps_ > 0 ? taps_ - 1 : 0, T{});
         frac_ = 0.0;
     }
 
@@ -68,57 +69,61 @@ public:
             std::copy(in, in + count, out);
             return count;
         }
-        size_t produced = 0;
-        const size_t k = taps_;
-        for (size_t i = 0; i < count; i++) {
-            history_[pos_] = history_[pos_ + k] = in[i];
-            pos_ = pos_ + 1 == k ? 0 : pos_ + 1;
-            const T* x = &history_[pos_];
-            while (frac_ < 1.0) {
-                double ph = frac_ * phases_;
-                int p = int(ph);
-                float a = float(ph - p);
-                const float* b0 = &bank_[size_t(p) * k];
-                const float* b1 = b0 + k;
-                if constexpr (sizeof(T) == 2 * sizeof(float)) {
-                    // Complex / Stereo: two interleaved floats, written so the
-                    // compiler can vectorise it.
-                    const float* xf = reinterpret_cast<const float*>(x);
-                    float r0 = 0.0f, i0 = 0.0f, r1 = 0.0f, i1 = 0.0f;
-                    for (size_t j = 0; j < k; j++) {
-                        const float xr = xf[2 * j], xi = xf[2 * j + 1];
-                        r0 += xr * b0[j];
-                        i0 += xi * b0[j];
-                        r1 += xr * b1[j];
-                        i1 += xi * b1[j];
-                    }
-                    const float wa = 1.0f - a;
-                    T v;
-                    float* vf = reinterpret_cast<float*>(&v);
-                    vf[0] = r0 * wa + r1 * a;
-                    vf[1] = i0 * wa + i1 * a;
-                    out[produced++] = v;
-                } else {
-                    T acc0{}, acc1{};
-                    for (size_t j = 0; j < k; j++) {
-                        acc0 += x[j] * b0[j];
-                        acc1 += x[j] * b1[j];
-                    }
-                    out[produced++] = acc0 * (1.0f - a) + acc1 * a;
-                }
-                frac_ += step_;
+        if (count == 0) return 0;
+        const size_t k = taps_, h = k - 1;
+        buffer_.resize(h + count);
+        std::copy(in, in + count, buffer_.begin() + std::ptrdiff_t(h));
+
+        size_t produced = 0, i = 0;
+        while (i < count) {
+            if (frac_ >= 1.0) {
+                // No output before the next input sample(s).
+                const size_t skip = std::min(count - i, size_t(frac_));
+                i += skip;
+                frac_ -= double(skip);
+                continue;
             }
-            frac_ -= 1.0;
+            // Output between filter phases p and p + 1, window ending at input i.
+            const double ph = frac_ * phases_;
+            const int p = std::min(int(ph), phases_ - 1);
+            const float a = float(ph - p);
+            out[produced++] = interpolate(&buffer_[i], p, a);
+            frac_ += step_;
         }
+        std::copy(buffer_.end() - std::ptrdiff_t(h), buffer_.end(), buffer_.begin());
+        buffer_.resize(h);
         return produced;
     }
 
 private:
+    T interpolate(const T* x, int p, float a) const {
+        const size_t k = taps_;
+        if constexpr (detail::kIsPair<T>) {
+            const float* b0 = &bank_[size_t(p) * 2 * k];
+            float f0, s0, f1, s1;
+            pairDotProduct2(reinterpret_cast<const float*>(x), b0, b0 + 2 * k, k, &f0, &s0, &f1, &s1);
+            return T(f0 + a * (f1 - f0), s0 + a * (s1 - s0));
+        } else if constexpr (std::is_same_v<T, float>) {
+            const float* b0 = &bank_[size_t(p) * k];
+            float s0, s1;
+            dotProduct2(x, b0, b0 + k, k, &s0, &s1);
+            return s0 + a * (s1 - s0);
+        } else {
+            const float* b0 = &bank_[size_t(p) * k];
+            const float* b1 = b0 + k;
+            T acc0{}, acc1{};
+            for (size_t j = 0; j < k; j++) {
+                acc0 += x[j] * b0[j];
+                acc1 += x[j] * b1[j];
+            }
+            return acc0 * (1.0f - a) + acc1 * a;
+        }
+    }
+
     std::vector<float> bank_;
-    std::vector<T> history_;
+    std::vector<T> buffer_;  // the last taps-1 inputs, then the current block
     size_t taps_ = 0;
-    size_t pos_ = 0;
-    int phases_ = 64;
+    int phases_ = 128;
     double step_ = 1.0;
     double frac_ = 0.0;
     double inRate_ = 0.0, outRate_ = 0.0;

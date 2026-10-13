@@ -137,6 +137,8 @@ private:
     double uiTestStartBw_ = 0.0;
     int uiTestFailures_ = 0;
     ImVec2 uiTestVolumeMin_, uiTestVolumeMax_;  // toolbar volume slider
+    struct HookProbe;
+    std::shared_ptr<HookProbe> hookProbe_;  // what the stream hooks saw during the UI test
 };
 
 }  // namespace SharkSDR
