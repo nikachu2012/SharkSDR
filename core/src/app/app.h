@@ -10,7 +10,9 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,7 +35,7 @@ public:
     Engine& engine() { return *engine_; }
     nlohmann::json& pluginSettings(const std::string& pluginName);
     void saveConfig();
-    void addPanel(OwnerId owner, const std::string& title, std::function<void()> draw);
+    void addPanel(OwnerId owner, const std::string& title, std::function<void()> draw, bool defaultOpen = false);
     void addFrameCallback(OwnerId owner, std::function<void()> fn);
     void addMenu(OwnerId owner, std::function<void()> fn);
     void addOverlay(OwnerId owner, OverlayFn fn);
@@ -55,6 +57,20 @@ private:
         OwnerId owner;
         std::string title;
         std::function<void()> draw;
+        bool defaultOpen = false;
+    };
+    // The sidebars on both sides of the spectrum. Panels are placed by title,
+    // so a plugin's panels come back where they were when it is enabled again.
+    enum Side { kLeft, kRight };
+    struct Sidebar {
+        float width = 300.0f;
+        bool show = true;
+        std::vector<std::string> order;  // panel titles, top to bottom
+    };
+    struct PanelMove {
+        std::string title;
+        Side side;
+        std::string before;  // the panel to insert it before; empty for the end
     };
     struct Callback {
         OwnerId owner;
@@ -78,9 +94,14 @@ private:
     void drawFrame();
     void drawMenuBar();
     void drawToolbar(float height);
-    void drawSidebar();
+    void drawSidebar(Side side, float height);
     void drawStatusBar(float height);
-    bool beginPanel(const char* title, bool defaultOpen = true);
+    bool beginPanel(const char* title, bool defaultOpen);
+    bool isPlaced(const std::string& title) const;
+    void placePanel(const Panel& panel);
+    std::vector<size_t> panelsOn(Side side) const;  // indices into panels_, top to bottom
+    bool sidebarVisible(Side side) const { return sidebars_[side].show && !panelsOn(side).empty(); }
+    void movePanel(const PanelMove& move);
     void drawSourcePanel();
     void drawRadioPanel();
     void drawAudioPanel();
@@ -115,8 +136,8 @@ private:
     float dpiScale_ = 1.0f;
     float uiScale_ = 1.0f;
     ui::Theme theme_ = ui::Theme::Dark;
-    float sidebarWidth_ = 300.0f;
-    bool showSidebar_ = true;
+    Sidebar sidebars_[2];
+    std::optional<PanelMove> pendingMove_;  // applied after the sidebars are drawn
     bool showStatusBar_ = true;
     bool showPlugins_ = false;
     bool showLog_ = false;
@@ -137,6 +158,9 @@ private:
     double uiTestStartBw_ = 0.0;
     int uiTestFailures_ = 0;
     ImVec2 uiTestVolumeMin_, uiTestVolumeMax_;  // toolbar volume slider
+    std::map<std::string, ImVec2> uiTestHeaders_;  // center of each panel title
+    ImVec2 uiTestSidebarMin_[2];                   // top-left of each sidebar
+    ImVec2 uiTestMenuItem_;                        // "Move to the ... sidebar" in a panel's menu
     struct HookProbe;
     std::shared_ptr<HookProbe> hookProbe_;  // what the stream hooks saw during the UI test
 };

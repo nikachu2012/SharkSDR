@@ -67,11 +67,15 @@ void SpectrumView::saveState(nlohmann::json& j) const {
 
 // ---- view geometry ----------------------------------------------------------------
 
-double SpectrumView::viewSpan() const {
+// The usable part of the band (without the source's filter edges), all of
+// which is shown at zoom 1.
+double SpectrumView::bandSpan() const {
     double rate = engine_.sampleRate();
     if (rate <= 0.0) rate = lastRate_ > 0.0 ? lastRate_ : 2.4e6;
-    return rate / zoom_;
+    return rate * engine_.usableSpectrumRatio();
 }
+
+double SpectrumView::viewSpan() const { return bandSpan() / zoom_; }
 
 double SpectrumView::viewStart() const { return engine_.centerFrequency() + viewOffset_ - viewSpan() * 0.5; }
 
@@ -82,9 +86,8 @@ double SpectrumView::maxZoom() const {
 
 void SpectrumView::clampView() {
     zoom_ = std::clamp(zoom_, 1.0, maxZoom());
-    double rate = engine_.sampleRate();
-    if (rate <= 0.0) rate = lastRate_ > 0.0 ? lastRate_ : 2.4e6;
-    const double limit = (rate - rate / zoom_) * 0.5;
+    const double band = bandSpan();
+    const double limit = (band - band / zoom_) * 0.5;
     viewOffset_ = std::clamp(viewOffset_, -limit, limit);
 }
 
@@ -265,10 +268,13 @@ void SpectrumView::redrawWaterfall() {
 
 void SpectrumView::autoRange() {
     if (smooth_.empty()) return;
-    std::vector<float> v = smooth_;
+    // Only the usable part: the filter edges would pull the floor down.
+    const size_t edge = size_t(double(smooth_.size()) * (1.0 - engine_.usableSpectrumRatio()) * 0.5);
+    std::vector<float> v(smooth_.begin() + std::ptrdiff_t(edge), smooth_.end() - std::ptrdiff_t(edge));
+    if (v.empty()) return;
+    const float peak = *std::max_element(v.begin(), v.end());
     std::nth_element(v.begin(), v.begin() + v.size() / 5, v.end());
     const float floorDb = v[v.size() / 5];
-    const float peak = *std::max_element(smooth_.begin(), smooth_.end());
     minDb_ = std::floor(floorDb - 12.0f);
     maxDb_ = std::ceil(std::max(peak + 8.0f, minDb_ + 40.0f));
 }

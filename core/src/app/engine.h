@@ -80,6 +80,9 @@ public:
     double centerFrequency() const { return center_.load(); }
     void setCenterFrequency(double hz);
     double sampleRate() const { return rate_.load(); }
+    // The span worth showing and tuning in: the source's usable part of the band.
+    double usableBandwidth() const { return rate_.load() * usableRatio_.load(); }
+    double usableSpectrumRatio() const { return usableRatio_.load(); }
     bool centerTuning() const { return centerTuning_; }
     void setCenterTuning(bool on);
     double snap() const;
@@ -190,6 +193,7 @@ private:
     void spectrumLoop();
     void computeSpectrumFrame();
     void retune(double centerHz);
+    void readSourceRate();  // rate_ and usableRatio_ from the current source
     void clampVfo();
     ModeEntry* findMode(const std::string& name);
     void applyMode(ModeEntry& entry);
@@ -213,6 +217,7 @@ private:
     std::atomic<double> vfo_{100.0e6};
     std::atomic<double> center_{100.0e6};
     std::atomic<double> rate_{0.0};
+    std::atomic<double> usableRatio_{1.0};  // Source::usableSpectrumRatio()
     bool centerTuning_ = false;
     std::map<std::string, double> snaps_;
 

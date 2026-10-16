@@ -54,6 +54,7 @@ public:
 
     std::string name() const override { return "SoapySDR"; }
     double sampleRate() const override { return rate_.load(); }
+    double usableSpectrumRatio() const override { return usableRatio_.load(); }
     std::string lastError() const override { return error_; }
 
     void onSelected() override {
@@ -243,6 +244,8 @@ private:
         antennas_ = device_->listAntennas(SOAPY_SDR_RX, 0);
         if (antenna_.empty() || std::find(antennas_.begin(), antennas_.end(), antenna_) == antennas_.end())
             antenna_ = antennas_.empty() ? "" : device_->getAntenna(SOAPY_SDR_RX, 0);
+        // An RTL-SDR: the RTL2832U's decimation filter rolls off above about 80 % of the rate.
+        usableRatio_ = device_->getDriverKey() == "RTLSDR" ? 0.8 : 1.0;
         hasAgc_ = device_->hasGainMode(SOAPY_SDR_RX, 0);
         hasPpm_ = device_->hasFrequencyCorrection(SOAPY_SDR_RX, 0);
         gainRanges_.clear();
@@ -324,6 +327,7 @@ private:
     double ppm_ = 0.0;
 
     std::atomic<double> rate_{2.4e6};
+    std::atomic<double> usableRatio_{1.0};
     std::atomic<double> center_{100e6};
     std::thread thread_;
     std::atomic<bool> quit_{false};

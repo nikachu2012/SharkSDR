@@ -23,6 +23,8 @@ bool isIqPoint(ProcessorType t) { return t == ProcessorType::RawIQ || t == Proce
 bool isAudioPoint(ProcessorType t) {
     return t == ProcessorType::DemodulatorOutput || t == ProcessorType::FilteredAudioOutput || t == ProcessorType::MonitorAF;
 }
+
+double usableRatio(const Source& source) { return std::clamp(source.usableSpectrumRatio(), 0.1, 1.0); }
 }  // namespace
 
 // DSP thread.
@@ -121,7 +123,7 @@ bool Engine::selectSource(const std::string& name) {
         current_ = e.source;
         preferredSource_ = name;
         current_->onSelected();
-        rate_ = current_->sampleRate();
+        readSourceRate();
         if (current_->tunable()) current_->tune(center_.load());
         else center_ = current_->frequency();
         clampVfo();
@@ -141,7 +143,7 @@ bool Engine::start() {
     }
     lastError_.clear();
     flushRequested_ = true;
-    rate_ = current_->sampleRate();
+    readSourceRate();
     if (current_->tunable()) current_->tune(center_.load());
     stopRequested_ = false;
     running_ = true;
@@ -178,8 +180,8 @@ void Engine::update() {
     }
     if (current_) {
         const double r = current_->sampleRate();
-        if (r != rate_.load()) {
-            rate_ = r;
+        if (r != rate_.load() || usableRatio(*current_) != usableRatio_.load()) {
+            readSourceRate();
             clampVfo();
         }
         if (!current_->tunable()) {
@@ -214,19 +216,24 @@ void Engine::retune(double centerHz) {
     if (current_ && current_->tunable()) current_->tune(centerHz);
 }
 
+void Engine::readSourceRate() {
+    rate_ = current_->sampleRate();
+    usableRatio_ = usableRatio(*current_);
+}
+
 void Engine::clampVfo() {
-    const double rate = rate_.load();
-    if (rate <= 0.0) return;
-    const double c = center_.load();
-    vfo_ = std::clamp(vfo_.load(), c - rate * 0.5, c + rate * 0.5);
+    if (rate_.load() <= 0.0) return;
+    const double c = center_.load(), half = usableBandwidth() * 0.5;
+    vfo_ = std::clamp(vfo_.load(), c - half, c + half);
 }
 
 void Engine::setFrequency(double hz) {
     hz = std::max(0.0, hz);
     const double rate = rate_.load();
     const double c = center_.load();
+    const double half = usableBandwidth() * 0.5;
     if (current_ && !current_->tunable()) {
-        vfo_ = rate > 0.0 ? std::clamp(hz, c - rate * 0.5, c + rate * 0.5) : hz;
+        vfo_ = rate > 0.0 ? std::clamp(hz, c - half, c + half) : hz;
         return;
     }
     if (centerTuning_) {
@@ -234,7 +241,6 @@ void Engine::setFrequency(double hz) {
         vfo_ = hz;
         return;
     }
-    const double half = rate * 0.5;
     const double margin = std::min(bandwidth() * 0.5, half * 0.5);
     if (rate <= 0.0 || hz - margin < c - half || hz + margin > c + half) {
         // Outside the visible band: move the center, keeping the VFO at the

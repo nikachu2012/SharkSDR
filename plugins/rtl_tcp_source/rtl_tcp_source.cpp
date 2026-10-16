@@ -89,6 +89,9 @@ public:
 
     std::string name() const override { return "RTL-TCP"; }
     double sampleRate() const override { return rate_.load(); }
+    // The RTL2832U's decimation filter rolls off above about 80 % of the rate
+    // (3 dB down at +-0.99 MHz, 7.5 dB at the edge with 2.4 MS/s).
+    double usableSpectrumRatio() const override { return 0.8; }
     std::string lastError() const override { return error_; }
 
     bool start(SharkSDR::SampleSink& sink) override {

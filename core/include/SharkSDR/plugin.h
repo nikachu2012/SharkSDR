@@ -26,7 +26,7 @@
 namespace SharkSDR {
 
 // Bumped whenever the plugin interface changes in an incompatible way.
-constexpr int kPluginApiVersion = 2;
+constexpr int kPluginApiVersion = 3;
 
 struct PluginInfo {
     const char* name;

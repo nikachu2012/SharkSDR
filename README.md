@@ -92,7 +92,7 @@ There are also self-tests for developers that drive the GUI (they inject input i
 # typing values into sliders (Enter applies / Esc cancels, vertical sliders too) and stream hooks
 # at every point (replacing the audio in MonitorAF, bypassing the demodulator, removal),
 # and records for about 1 second with Ctrl+R meanwhile (exit code 2 on failure)
-SharkSDR --config <temporary folder> --autostart --test-ui --screenshot ui.png --frames 220
+SharkSDR --config <temporary folder> --autostart --test-ui --screenshot ui.png --frames 250
 # Unloads and reloads every plugin while receiving
 SharkSDR --config <temporary folder> --autostart --test-plugin-reload --screenshot reload.png --frames 600
 ```
@@ -111,6 +111,7 @@ so you can try it right away without hardware: press the ▶ button (or Space). 
 | Right or middle drag | Pan the zoomed view |
 | Wheel over a digit of the frequency dial / click its upper or lower half | Increase or decrease that digit (right-click sets the lower digits to 0) |
 | Double-click a slider (or Ctrl+click) | Type a value (Enter applies, Esc cancels; units such as `12.5k` or `-40 dB` are accepted) |
+| Drag a panel title (or right-click it) | Move the panel to the other sidebar or reorder it (plugin panels start on the right) |
 | Space / ← → / M | Start or stop / step tuning / mute |
 | Ctrl+S / Ctrl+Q | Save settings / quit |
 | Ctrl+R | Start or stop recording (Recorder plugin) |

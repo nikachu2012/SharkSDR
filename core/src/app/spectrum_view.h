@@ -59,6 +59,8 @@ private:
         int width = 0;
     };
 
+    double bandSpan() const;
+
     double viewSpan() const;
     double viewStart() const;
     double viewEnd() const { return viewStart() + viewSpan(); }

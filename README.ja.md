@@ -91,7 +91,7 @@ GUI を伴う開発者向けのセルフテストもあります（実際のマ�
 # クリック選局・ホイール選局・Ctrl+ホイールでズーム・帯域端ドラッグ・右ドラッグでパン・
 # スライダーへの数値入力（Enter で確定 / Esc で取り消し、縦スライダーも）・全地点のストリームフック
 # （MonitorAF での音声の差し替え、復調のバイパス、解除）を検証し、その間 Ctrl+R で約 1 秒録音する（失敗時は終了コード 2）
-SharkSDR --config <一時フォルダ> --autostart --test-ui --screenshot ui.png --frames 220
+SharkSDR --config <一時フォルダ> --autostart --test-ui --screenshot ui.png --frames 250
 # 受信中に全プラグインをアンロード → 再ロード
 SharkSDR --config <一時フォルダ> --autostart --test-plugin-reload --screenshot reload.png --frames 600
 ```
@@ -110,6 +110,7 @@ SharkSDR --config <一時フォルダ> --autostart --test-plugin-reload --screen
 | 右／中ボタンドラッグ | ズーム中の表示をパン |
 | 周波数ダイヤルの桁の上でホイール／上半分・下半分をクリック | その桁を増減（右クリックで下位桁を 0 に） |
 | スライダーをダブルクリック（または Ctrl+クリック） | 数値を直接入力（Enter で確定、Esc で取り消し。`12.5k` や `-40 dB` のように単位付きでも可） |
+| パネルの見出しをドラッグ（または右クリック） | パネルを左右のサイドバーへ移動・並べ替え（プラグインのパネルは最初は右側） |
 | Space / ← → / M | 開始・停止 / ステップ選局 / ミュート |
 | Ctrl+S / Ctrl+Q | 設定保存 / 終了 |
 | Ctrl+R | 録音の開始・停止（Recorder プラグイン） |

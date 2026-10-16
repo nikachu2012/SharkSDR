@@ -48,6 +48,9 @@ namespace {
 
 constexpr float kBaseFontSize = 15.0f;
 constexpr const char* kAppName = "SharkSDR";
+constexpr float kSplitterWidth = 5.0f;
+constexpr const char* kPanelPayload = "SHARKSDR_PANEL";  // drag and drop of a panel title
+constexpr const char* kSideNames[] = {"left", "right"};
 
 void glfwErrorCallback(int code, const char* description) {
     logError("GLFW", "Error " + std::to_string(code) + ": " + description);
@@ -104,6 +107,10 @@ App::App() {
     engine_ = std::make_unique<Engine>(*audio_);
     spectrum_ = std::make_unique<SpectrumView>(*engine_);
     plugins_ = std::make_unique<PluginManager>(*this);
+    addPanel(kCoreOwner, "Source", [this] { drawSourcePanel(); }, true);
+    addPanel(kCoreOwner, "Radio", [this] { drawRadioPanel(); }, true);
+    addPanel(kCoreOwner, "Audio", [this] { drawAudioPanel(); });
+    addPanel(kCoreOwner, "Display", [this] { drawDisplayPanel(); });
 }
 
 App::~App() { shutdown(); }
@@ -129,7 +136,7 @@ bool App::parseArguments(int argc, char** argv) {
                 "  --autostart        start receiving immediately\n"
                 "  --screenshot FILE  save a PNG of the window after --frames N frames and exit\n"
                 "  --test-plugin-reload  (developer) unload and reload every plugin while running\n"
-                "  --test-ui          (developer) inject mouse input and check the spectrum interactions\n",
+                "  --test-ui          (developer) inject mouse input and check the spectrum and panel interactions\n",
                 versionString());
             return false;
         }
@@ -159,8 +166,18 @@ void App::loadConfig() {
         config_["pluginSettings"] = nlohmann::json::object();
 
     const auto& ui = config_.value("ui", nlohmann::json::object());
-    sidebarWidth_ = ui.value("sidebarWidth", sidebarWidth_);
-    showSidebar_ = ui.value("showSidebar", showSidebar_);
+    sidebars_[kLeft].width = ui.value("sidebarWidth", sidebars_[kLeft].width);
+    sidebars_[kLeft].show = ui.value("showSidebar", sidebars_[kLeft].show);
+    sidebars_[kRight].width = ui.value("rightSidebarWidth", sidebars_[kRight].width);
+    sidebars_[kRight].show = ui.value("showRightSidebar", sidebars_[kRight].show);
+    for (auto& sb : sidebars_) sb.order.clear();
+    const auto layout = ui.value("panelLayout", nlohmann::json::object());
+    for (Side s : {kLeft, kRight}) {
+        const auto titles = layout.is_object() ? layout.value(kSideNames[s], nlohmann::json::array()) : nlohmann::json::array();
+        for (const auto& t : titles)
+            if (t.is_string() && !isPlaced(t.get<std::string>())) sidebars_[s].order.push_back(t.get<std::string>());
+    }
+    for (const auto& p : panels_) placePanel(p);  // the built-in panels, unless placed already
     showStatusBar_ = ui.value("showStatusBar", showStatusBar_);
     uiScale_ = std::clamp(ui.value("scale", uiScale_), 0.5f, 3.0f);
     theme_ = ui.value("theme", std::string("dark")) == "light" ? ui::Theme::Light : ui::Theme::Dark;
@@ -180,8 +197,11 @@ void App::storeState() {
     config_["display"] = display;
 
     nlohmann::json ui = config_.value("ui", nlohmann::json::object());
-    ui["sidebarWidth"] = sidebarWidth_;
-    ui["showSidebar"] = showSidebar_;
+    ui["sidebarWidth"] = sidebars_[kLeft].width;
+    ui["showSidebar"] = sidebars_[kLeft].show;
+    ui["rightSidebarWidth"] = sidebars_[kRight].width;
+    ui["showRightSidebar"] = sidebars_[kRight].show;
+    ui["panelLayout"] = {{kSideNames[kLeft], sidebars_[kLeft].order}, {kSideNames[kRight], sidebars_[kRight].order}};
     ui["showStatusBar"] = showStatusBar_;
     ui["scale"] = uiScale_;
     ui["theme"] = theme_ == ui::Theme::Light ? "light" : "dark";
@@ -245,8 +265,36 @@ nlohmann::json& App::pluginSettings(const std::string& pluginName) {
 
 // ---- registries -------------------------------------------------------------------
 
-void App::addPanel(OwnerId owner, const std::string& title, std::function<void()> draw) {
-    panels_.push_back({owner, title, std::move(draw)});
+void App::addPanel(OwnerId owner, const std::string& title, std::function<void()> draw, bool defaultOpen) {
+    panels_.push_back({owner, title, std::move(draw), defaultOpen});
+    placePanel(panels_.back());
+}
+
+bool App::isPlaced(const std::string& title) const {
+    for (const auto& sb : sidebars_)
+        if (std::find(sb.order.begin(), sb.order.end(), title) != sb.order.end()) return true;
+    return false;
+}
+
+void App::placePanel(const Panel& panel) {
+    // The application's own panels start on the left, the plugins' on the right.
+    if (!isPlaced(panel.title)) sidebars_[panel.owner == kCoreOwner ? kLeft : kRight].order.push_back(panel.title);
+}
+
+std::vector<size_t> App::panelsOn(Side side) const {
+    std::vector<size_t> shown;
+    for (const auto& title : sidebars_[side].order)
+        for (size_t i = 0; i < panels_.size(); i++)
+            if (panels_[i].title == title) shown.push_back(i);
+    return shown;
+}
+
+void App::movePanel(const PanelMove& move) {
+    if (move.title == move.before) return;
+    for (auto& sb : sidebars_) sb.order.erase(std::remove(sb.order.begin(), sb.order.end(), move.title), sb.order.end());
+    auto& order = sidebars_[move.side].order;
+    order.insert(std::find(order.begin(), order.end(), move.before), move.title);
+    sidebars_[move.side].show = true;
 }
 
 void App::addFrameCallback(OwnerId owner, std::function<void()> fn) { frameCallbacks_.push_back({owner, std::move(fn)}); }
@@ -744,6 +792,40 @@ void App::uiTestStep() {
                    std::to_string(hookProbe_->total() - hookProbe_->totalAtRemoval) + " calls after removal");
             hookProbe_.reset();
             break;
+        // Drag the Source panel by its title to the top of the right sidebar.
+        case 216:
+            uiTestValue_ = uiTestHeaders_["Source"].x;
+            uiTestValue2_ = uiTestHeaders_["Source"].y;
+            io.AddMousePosEvent(float(uiTestValue_), float(uiTestValue2_));
+            break;
+        case 218: io.AddMouseButtonEvent(ImGuiMouseButton_Left, true); break;
+        case 220: io.AddMousePosEvent(float(uiTestValue_) + 20.0f, float(uiTestValue2_)); break;  // starts the drag
+        case 222: io.AddMousePosEvent(uiTestSidebarMin_[kRight].x + 40.0f, uiTestSidebarMin_[kRight].y + 3.0f); break;
+        case 224: io.AddMouseButtonEvent(ImGuiMouseButton_Left, false); break;
+        case 226: {
+            const auto shown = panelsOn(kRight);
+            const std::string first = shown.empty() ? "nothing" : panels_[shown.front()].title;
+            report("dragging a panel title moves it to the other sidebar", first == "Source",
+                   "right sidebar starts with " + first);
+            movePanel({"Source", kLeft, "Radio"});
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+            break;
+        }
+        // Right-click the Radio title and choose "Move to the right sidebar".
+        case 228: io.AddMousePosEvent(uiTestHeaders_["Radio"].x, uiTestHeaders_["Radio"].y); break;
+        case 230: io.AddMouseButtonEvent(ImGuiMouseButton_Right, true); break;
+        case 231: io.AddMouseButtonEvent(ImGuiMouseButton_Right, false); break;
+        case 234: io.AddMousePosEvent(uiTestMenuItem_.x, uiTestMenuItem_.y); break;
+        case 236: io.AddMouseButtonEvent(ImGuiMouseButton_Left, true); break;
+        case 237: io.AddMouseButtonEvent(ImGuiMouseButton_Left, false); break;
+        case 240: {
+            const auto shown = panelsOn(kRight);
+            const std::string last = shown.empty() ? "nothing" : panels_[shown.back()].title;
+            report("the title's menu moves a panel to the other sidebar", last == "Radio", "right sidebar ends with " + last);
+            movePanel({"Radio", kLeft, "Audio"});
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+            break;
+        }
         // Ctrl+R twice: handled by the Recorder plugin (start, then stop ~1 s later).
         case 100:
         case 200:
@@ -812,34 +894,42 @@ void App::drawFrame() {
     const float statusH = showStatusBar_ ? ImGui::GetFrameHeight() : 0.0f;
     const float contentH = std::max(50.0f, ImGui::GetContentRegionAvail().y - statusH);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-    if (showSidebar_) {
-        sidebarWidth_ = std::clamp(sidebarWidth_, 180.0f, std::max(200.0f, ImGui::GetContentRegionAvail().x * 0.6f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, theme_ == ui::Theme::Dark ? ImVec4(0.09f, 0.098f, 0.112f, 1.0f)
-                                                                          : ImVec4(0.92f, 0.93f, 0.945f, 1.0f));
-        ImGui::BeginChild("##sidebar", ImVec2(sidebarWidth_, contentH), ImGuiChildFlags_AlwaysUseWindowPadding);
-        ImGui::PopStyleVar();
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 5));
-        drawSidebar();
-        ImGui::PopStyleVar();
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
+    // While a panel is dragged both sidebars are shown, to drop it on either.
+    const ImGuiPayload* payload = ImGui::GetDragDropPayload();
+    const bool draggingPanel = payload && payload->IsDataType(kPanelPayload);
+    bool visible[2];
+    for (Side s : {kLeft, kRight}) visible[s] = draggingPanel || sidebarVisible(s);
 
-        ImGui::SameLine();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    // The sidebars together take at most 60 % of the width.
+    const float availW = ImGui::GetContentRegionAvail().x;
+    for (Side s : {kLeft, kRight}) {
+        const Side other = s == kLeft ? kRight : kLeft;
+        const float otherW = visible[other] ? sidebars_[other].width + kSplitterWidth : 0.0f;
+        if (visible[s]) sidebars_[s].width = std::clamp(sidebars_[s].width, 180.0f, std::max(200.0f, availW * 0.6f - otherW));
+    }
+    auto splitter = [&](const char* id, Side side) {
         const ImVec2 sp = ImGui::GetCursorScreenPos();
-        ImGui::InvisibleButton("##sidesplit", ImVec2(5.0f, contentH));
+        ImGui::InvisibleButton(id, ImVec2(kSplitterWidth, contentH));
         const bool splitActive = ImGui::IsItemActive();
         if (ImGui::IsItemHovered() || splitActive) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        if (splitActive) sidebarWidth_ += ImGui::GetIO().MouseDelta.x;
+        if (splitActive) sidebars_[side].width += side == kLeft ? ImGui::GetIO().MouseDelta.x : -ImGui::GetIO().MouseDelta.x;
         ImGui::GetWindowDrawList()->AddLine(ImVec2(sp.x + 2.0f, sp.y), ImVec2(sp.x + 2.0f, sp.y + contentH),
                                             splitActive || ImGui::IsItemHovered() ? ui::colors::kAccent
                                                                                   : ImGui::GetColorU32(ImGuiCol_Border));
+    };
+
+    if (visible[kLeft]) {
+        drawSidebar(kLeft, contentH);
+        ImGui::SameLine();
+        splitter("##sidesplit", kLeft);
         ImGui::SameLine();
     }
 
+    const float mainW =
+        visible[kRight] ? std::max(50.0f, ImGui::GetContentRegionAvail().x - sidebars_[kRight].width - kSplitterWidth) : 0.0f;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6, 6));
-    ImGui::BeginChild("##mainarea", ImVec2(0, contentH), ImGuiChildFlags_AlwaysUseWindowPadding,
+    ImGui::BeginChild("##mainarea", ImVec2(mainW, contentH), ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 4));
@@ -848,7 +938,19 @@ void App::drawFrame() {
     spectrum_->draw(ImGui::GetContentRegionAvail(), overlays);
     ImGui::PopStyleVar();
     ImGui::EndChild();
+
+    if (visible[kRight]) {
+        ImGui::SameLine();
+        splitter("##rightsplit", kRight);
+        ImGui::SameLine();
+        drawSidebar(kRight, contentH);
+    }
     ImGui::PopStyleVar();
+
+    if (pendingMove_) {
+        movePanel(*pendingMove_);
+        pendingMove_.reset();
+    }
 
     if (showStatusBar_) drawStatusBar(statusH);
     ImGui::End();
@@ -869,7 +971,8 @@ void App::drawMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
-        ImGui::MenuItem("Sidebar", nullptr, &showSidebar_);
+        ImGui::MenuItem("Left sidebar", nullptr, &sidebars_[kLeft].show, !panelsOn(kLeft).empty());
+        ImGui::MenuItem("Right sidebar", nullptr, &sidebars_[kRight].show, !panelsOn(kRight).empty());
         ImGui::MenuItem("Status bar", nullptr, &showStatusBar_);
         if (ImGui::BeginMenu("Theme")) {
             if (ImGui::MenuItem("Dark", nullptr, theme_ == ui::Theme::Dark)) setTheme(ui::Theme::Dark);
@@ -938,9 +1041,11 @@ void App::drawToolbar(float height) {
                 const float y = a.y + h * 0.5f + float(i) * h * 0.2f;
                 dl->AddLine(ImVec2(a.x + w * 0.25f, y), ImVec2(b.x - w * 0.25f, y), col, 2.0f);
             }
-        }))
-        showSidebar_ = !showSidebar_;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show/hide the sidebar");
+        })) {
+        const bool any = sidebarVisible(kLeft) || sidebarVisible(kRight);
+        sidebars_[kLeft].show = sidebars_[kRight].show = !any;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show/hide the sidebars");
 
     // Play / stop
     ImGui::SameLine();
@@ -1100,25 +1205,86 @@ void App::drawStatusBar(float height) {
 // ---- sidebar ------------------------------------------------------------------------
 
 bool App::beginPanel(const char* title, bool defaultOpen) {
+    // Always: the header keeps its state when the panel moves to the other sidebar.
     const bool open = panelOpen_.value(title, defaultOpen);
-    ImGui::SetNextItemOpen(open, ImGuiCond_Once);
+    ImGui::SetNextItemOpen(open, ImGuiCond_Always);
     const bool now = ImGui::CollapsingHeader(title);
     panelOpen_[title] = now;
     return now;
 }
 
-void App::drawSidebar() {
-    if (beginPanel("Source")) drawSourcePanel();
-    if (beginPanel("Radio")) drawRadioPanel();
-    if (beginPanel("Audio", false)) drawAudioPanel();
-    if (beginPanel("Display", false)) drawDisplayPanel();
-    for (size_t i = 0; i < panels_.size(); i++) {
-        ImGui::PushID(int(i) + 1000);
-        if (beginPanel(panels_[i].title.c_str(), false)) {
+void App::drawSidebar(Side side, float height) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, theme_ == ui::Theme::Dark ? ImVec4(0.09f, 0.098f, 0.112f, 1.0f)
+                                                                      : ImVec4(0.92f, 0.93f, 0.945f, 1.0f));
+    ImGui::BeginChild(side == kLeft ? "##sidebar" : "##rightsidebar", ImVec2(sidebars_[side].width, height),
+                      ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PopStyleVar();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 5));
+
+    const Side other = side == kLeft ? kRight : kLeft;
+    const std::vector<size_t> shown = panelsOn(side);
+    std::vector<float> headerY;  // top of each header, to drop a dragged panel between them
+    for (size_t k = 0; k < shown.size(); k++) {
+        const size_t i = shown[k];
+        const std::string title = panels_[i].title;
+        ImGui::PushID(panels_[i].owner);
+        headerY.push_back(ImGui::GetCursorScreenPos().y);
+        const bool open = beginPanel(title.c_str(), panels_[i].defaultOpen);
+        if (options_.uiTest) uiTestHeaders_[title] = (ImGui::GetItemRectMin() + ImGui::GetItemRectMax()) * 0.5f;
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers)) {
+            ImGui::SetDragDropPayload(kPanelPayload, title.c_str(), title.size() + 1);
+            ImGui::TextUnformatted(title.c_str());
+            ImGui::EndDragDropSource();
+        }
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem(side == kLeft ? "Move to the right sidebar" : "Move to the left sidebar"))
+                pendingMove_ = PanelMove{title, other, ""};
+            if (options_.uiTest) uiTestMenuItem_ = (ImGui::GetItemRectMin() + ImGui::GetItemRectMax()) * 0.5f;
+            if (ImGui::MenuItem("Move up", nullptr, false, k > 0)) pendingMove_ = PanelMove{title, side, panels_[shown[k - 1]].title};
+            if (ImGui::MenuItem("Move down", nullptr, false, k + 1 < shown.size()))
+                pendingMove_ = PanelMove{title, side, k + 2 < shown.size() ? panels_[shown[k + 2]].title : ""};
+            ImGui::EndPopup();
+        }
+        if (open) {
             panels_[i].draw();
             ImGui::Spacing();
         }
         ImGui::PopID();
+    }
+
+    // A dragged panel goes before the first header below the mouse.
+    size_t dropIndex = shown.size();
+    const ImGuiPayload* payload = ImGui::GetDragDropPayload();
+    if (payload && payload->IsDataType(kPanelPayload)) {
+        if (shown.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("Drop the panel here");
+            ImGui::PopStyleColor();
+        }
+        const ImVec2 wmin = ImGui::GetWindowPos(), wmax = wmin + ImGui::GetWindowSize();
+        if (ImGui::IsMouseHoveringRect(wmin, wmax, false)) {
+            const float mouseY = ImGui::GetIO().MousePos.y;
+            dropIndex = 0;
+            while (dropIndex < headerY.size() && headerY[dropIndex] + ImGui::GetFrameHeight() * 0.5f < mouseY) dropIndex++;
+            const float y = (dropIndex < headerY.size() ? headerY[dropIndex] : ImGui::GetCursorScreenPos().y) -
+                            std::floor(ImGui::GetStyle().ItemSpacing.y * 0.5f);
+            const float x = ImGui::GetCursorScreenPos().x;
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(x, y), ImVec2(x + ImGui::GetContentRegionAvail().x, y),
+                                                ui::colors::kAccent, 2.0f);
+        }
+    }
+
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    uiTestSidebarMin_[side] = ImGui::GetItemRectMin();
+
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* drop = ImGui::AcceptDragDropPayload(kPanelPayload, ImGuiDragDropFlags_AcceptNoDrawDefaultRect))
+            pendingMove_ = PanelMove{static_cast<const char*>(drop->Data), side,
+                                     dropIndex < shown.size() ? panels_[shown[dropIndex]].title : ""};
+        ImGui::EndDragDropTarget();
     }
 }
 
@@ -1168,7 +1334,6 @@ void App::drawSourcePanel() {
         ImGui::TextWrapped("%s", engine_->lastError().c_str());
         ImGui::PopStyleColor();
     }
-    ImGui::Spacing();
 }
 
 void App::drawRadioPanel() {
@@ -1250,7 +1415,6 @@ void App::drawRadioPanel() {
 
     ImGui::Separator();
     engine_->drawDemodulatorSettings();
-    ImGui::Spacing();
 }
 
 void App::drawAudioPanel() {
@@ -1275,13 +1439,9 @@ void App::drawAudioPanel() {
     bool muted = engine_->muted();
     if (ImGui::Checkbox("Mute", &muted)) engine_->setMuted(muted);
     ImGui::TextDisabled("Buffer %.0f ms, underruns %llu", audio_->bufferedMs(), (unsigned long long)audio_->underruns());
-    ImGui::Spacing();
 }
 
-void App::drawDisplayPanel() {
-    spectrum_->drawSettings();
-    ImGui::Spacing();
-}
+void App::drawDisplayPanel() { spectrum_->drawSettings(); }
 
 // ---- windows ------------------------------------------------------------------------
 
@@ -1413,6 +1573,7 @@ void App::drawShortcutsWindow() {
             {"Right / middle drag", "Pan the zoomed view"},
             {"Wheel / click on a digit", "Change that digit of the frequency"},
             {"Double-click a slider", "Type a value (also " SHARKSDR_CTRL_KEY "+click; Enter applies, Esc cancels)"},
+            {"Drag / right-click a panel title", "Move the panel to the other sidebar or reorder it"},
         };
         for (auto& r : rows) {
             ImGui::TableNextRow();

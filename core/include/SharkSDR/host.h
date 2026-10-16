@@ -98,8 +98,10 @@ public:
     // Add a demodulation mode (shown as a button in the "Radio" panel).
     virtual void registerDemodulator(const std::string& name, DemodulatorFactory factory) = 0;
 
-    // Add a collapsible panel to the sidebar. `draw` is called every frame
-    // while the panel is open, inside the sidebar (use ImGui widgets).
+    // Add a collapsible panel to the sidebar. Plugin panels start in the
+    // right sidebar; the user can drag them by the title (or use its
+    // right-click menu) to the left one or to another place. `draw` is called
+    // every frame while the panel is open, inside the sidebar (use ImGui widgets).
     virtual void registerPanel(const std::string& title, std::function<void()> draw) = 0;
 
     // Called once per frame after the main window is drawn. Use it to show

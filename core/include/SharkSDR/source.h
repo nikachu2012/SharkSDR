@@ -45,6 +45,12 @@ public:
     // Current sample rate in samples per second. May change while running.
     virtual double sampleRate() const = 0;
 
+    // The part of the band worth showing, as a fraction of the sample rate
+    // (SDR#'s UsableSpectrumRatio). Near the band edges the anti-aliasing
+    // filter of most hardware attenuates everything; those edges are left out
+    // of the spectrum and the waterfall, and the VFO stays clear of them.
+    virtual double usableSpectrumRatio() const { return 1.0; }
+
     // Whether the center frequency can be changed (false for e.g. file playback).
     virtual bool tunable() const { return true; }
 

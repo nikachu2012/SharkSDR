@@ -81,7 +81,7 @@ Everything you register is **removed automatically when the plugin is unloaded**
 |---|---|---|
 | `registerSource(std::shared_ptr<Source>)` | IQ source (hardware, network, file…) | `signal_generator`, `rtl_tcp_source`, `soapy_source` |
 | `registerDemodulator(name, factory)` | Demodulation mode (adds a button to the Radio panel) | `am_sync_demod` |
-| `registerPanel(title, draw)` | Collapsible sidebar panel | `recorder`, `bookmarks` |
+| `registerPanel(title, draw)` | Collapsible sidebar panel (in the right sidebar until the user moves it) | `recorder`, `bookmarks` |
 | `registerMenu(draw)` | Items in the Tools menu | `bookmarks`, `hello_example` |
 | `registerFrameCallback(fn)` | Called every frame (for your own windows) | `hello_example` |
 | `registerSpectrumOverlay(draw)` | Drawing and click handling on the spectrum | `bookmarks` |
@@ -130,6 +130,7 @@ private:
 - When the stream ends by itself (end of file, disconnection, etc.), call `sink.sourceStopped("reason")`. The application then calls `stop()` on the UI thread.
 - Sources that cannot change frequency (such as file playback) return `false` from `tunable()` and report their center frequency from `frequency()`.
 - The sample rate may change while running (the DSP follows when the value of `sampleRate()` changes).
+- If the hardware's anti-aliasing filter attenuates the band edges, return the usable fraction of the sample rate from `usableSpectrumRatio()` (SDR#'s UsableSpectrumRatio; `0.8` for RTL-SDR). The spectrum and waterfall then show only that part, and the VFO stays inside it.
 
 ## 5. Writing a demodulation mode
 

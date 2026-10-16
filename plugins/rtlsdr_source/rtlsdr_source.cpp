@@ -44,6 +44,8 @@ public:
 
     std::string name() const override { return "RTL-SDR"; }
     double sampleRate() const override { return rate_.load(); }
+    // The RTL2832U's decimation filter rolls off above about 80 % of the rate.
+    double usableSpectrumRatio() const override { return 0.8; }
     std::string lastError() const override { return error_; }
 
     void onSelected() override {

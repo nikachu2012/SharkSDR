@@ -81,7 +81,7 @@ SharkSDR のビルドと同じコンパイラ・同じ構成（Release／Debug�
 |---|---|---|
 | `registerSource(std::shared_ptr<Source>)` | IQ ソース（ハードウェア・ネットワーク・ファイル…） | `signal_generator`, `rtl_tcp_source`, `soapy_source` |
 | `registerDemodulator(name, factory)` | 復調モード（Radio パネルにボタンが増える） | `am_sync_demod` |
-| `registerPanel(title, draw)` | サイドバーの折りたたみパネル | `recorder`, `bookmarks` |
+| `registerPanel(title, draw)` | サイドバーの折りたたみパネル（ユーザーが動かすまでは右のサイドバー） | `recorder`, `bookmarks` |
 | `registerMenu(draw)` | Tools メニューの項目 | `bookmarks`, `hello_example` |
 | `registerFrameCallback(fn)` | 毎フレーム呼ばれる（独自ウィンドウ用） | `hello_example` |
 | `registerSpectrumOverlay(draw)` | スペクトラム上への描画・クリック処理 | `bookmarks` |
@@ -130,6 +130,7 @@ private:
 - ストリームが自然に終わった（ファイル終端・切断など）ときは `sink.sourceStopped("理由")` を呼びます。アプリが UI スレッドで `stop()` を呼び直します。
 - 周波数を変えられないソース（ファイル再生など）は `tunable()` で `false` を返し、`frequency()` で中心周波数を返します。
 - サンプルレートは実行中に変えて構いません（`sampleRate()` の値が変わると DSP が追従します）。
+- ハードウェアのアンチエイリアスフィルタで帯域の端が減衰する場合は、使える範囲をサンプルレートに対する割合で `usableSpectrumRatio()` から返してください（SDR# の UsableSpectrumRatio。RTL-SDR は `0.8`）。スペクトラムとウォーターフォールにはその範囲だけが表示され、VFO もその中に収まります。
 
 ## 5. 復調モードを作る
 
